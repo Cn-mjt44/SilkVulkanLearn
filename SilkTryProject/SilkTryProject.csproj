@@ -1,0 +1,118 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>SilkTry</RootNamespace>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <!--
+      glslc 可执行文件。查找顺序：
+        1. -p:GlslcPath=... 显式指定
+        2. 环境变量 GLSLC
+        3. PATH（LocateGlslc 目标里探测）
+        4. $VULKAN_SDK/bin/glslc
+    -->
+    <GlslcPath Condition="'$(GlslcPath)' == '' and '$(GLSLC)' != ''">$(GLSLC)</GlslcPath>
+
+    <!-- 传给 glslc 的编译参数（可覆盖：-p:GlslCompileFlags="..."） -->
+    <GlslCompileFlags Condition="'$(GlslCompileFlags)' == ''">--target-env=vulkan1.3</GlslCompileFlags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 参与编译的 GLSL 源文件。.spv 由 CompileShaders 目标生成，不要手写进仓库。 -->
+    <GlslShader Include="Shaders/**/*.vert" />
+    <GlslShader Include="Shaders/**/*.frag" />
+    <GlslShader Include="Shaders/**/*.comp" />
+    <GlslShader Include="Shaders/**/*.geom" />
+    <GlslShader Include="Shaders/**/*.tesc" />
+    <GlslShader Include="Shaders/**/*.tese" />
+    <GlslShader Include="Shaders/**/*.rgen" />
+    <GlslShader Include="Shaders/**/*.rchit" />
+    <GlslShader Include="Shaders/**/*.rmiss" />
+    <GlslShader Include="Shaders/**/*.rahit" />
+    <GlslShader Include="Shaders/**/*.rint" />
+    <GlslShader Include="Shaders/**/*.rcall" />
+    <GlslShader Include="Shaders/**/*.mesh" />
+    <GlslShader Include="Shaders/**/*.task" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Silk.NET.Assimp" Version="2.*" />
+    <PackageReference Include="Silk.NET.Core" Version="2.*" />
+    <PackageReference Include="Silk.NET.Vulkan" Version="2.*" />
+    <PackageReference Include="Silk.NET.Input.Sdl" Version="2.*" />
+    <PackageReference Include="Silk.NET.Windowing.Sdl" Version="2.*" />
+    <PackageReference Include="Silk.NET.Vulkan.Extensions.EXT" Version="2.*" />
+    <PackageReference Include="Silk.NET.Vulkan.Extensions.KHR" Version="2.*" />
+  </ItemGroup>
+
+  <!-- ===== GLSL → SPIR-V ===== -->
+
+  <!-- 找 glslc：显式指定 / 环境变量 GLSLC 优先，其次 PATH，最后 Vulkan SDK 安装目录。 -->
+  <Target Name="LocateGlslc" Condition="'$(GlslcPath)' == ''">
+    <Exec Condition="$([MSBuild]::IsOSPlatform('Windows'))"
+          Command="where glslc"
+          ConsoleToMSBuild="true"
+          IgnoreExitCode="true"
+          StandardOutputImportance="low"
+          StandardErrorImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_GlslcProbeOutput" />
+      <Output TaskParameter="ExitCode" PropertyName="_GlslcProbeExitCode" />
+    </Exec>
+
+    <Exec Condition="!$([MSBuild]::IsOSPlatform('Windows'))"
+          Command="command -v glslc"
+          ConsoleToMSBuild="true"
+          IgnoreExitCode="true"
+          StandardOutputImportance="low"
+          StandardErrorImportance="low">
+      <Output TaskParameter="ConsoleOutput" PropertyName="_GlslcProbeOutput" />
+      <Output TaskParameter="ExitCode" PropertyName="_GlslcProbeExitCode" />
+    </Exec>
+
+    <!-- where 可能返回多行（多份安装），ConsoleToMSBuild 用 ';' 拼接，取第一条即可 -->
+    <PropertyGroup>
+      <GlslcPath Condition="'$(_GlslcProbeExitCode)' == '0' and '$(_GlslcProbeOutput)' != ''">$([System.String]::Copy('$(_GlslcProbeOutput)').Trim().Split(';')[0])</GlslcPath>
+      <GlslcPath Condition="'$(GlslcPath)' == '' and '$(VULKAN_SDK)' != '' and $([MSBuild]::IsOSPlatform('Windows'))">$(VULKAN_SDK)\Bin\glslc.exe</GlslcPath>
+      <GlslcPath Condition="'$(GlslcPath)' == '' and '$(VULKAN_SDK)' != '' and !$([MSBuild]::IsOSPlatform('Windows'))">$(VULKAN_SDK)/bin/glslc</GlslcPath>
+    </PropertyGroup>
+
+    <Error Condition="'$(GlslcPath)' == ''"
+           Text="找不到 glslc。请安装 Vulkan SDK（或 shaderc），或显式指定：dotnet build -p:GlslcPath=/path/to/glslc，或设置环境变量 GLSLC。" />
+  </Target>
+
+  <!--
+    登记编译产物：内容在 obj/ 里，但通过 Link 以 Shaders/xxx.spv 的相对路径拷到输出目录，
+    这样 Game 里 AppContext.BaseDirectory/Shaders/xxx.spv 的读法和之前一致。
+    Content 必须在 AssignTargetPaths 之前加入，拷贝到输出目录时才会被收集。
+  -->
+  <Target Name="IncludeCompiledShaders" DependsOnTargets="LocateGlslc" BeforeTargets="AssignTargetPaths">
+    <ItemGroup>
+      <_CompiledShader Include="@(GlslShader->'$(IntermediateOutputPath)Shaders/%(Filename)%(Extension).spv')"
+                       Link="Shaders/%(Filename)%(Extension).spv" />
+      <Content Include="@(_CompiledShader)"
+               CopyToOutputDirectory="PreserveNewest"
+               CopyToPublishDirectory="PreserveNewest" />
+      <!-- 让 dotnet clean 也删掉这些生成物 -->
+      <FileWrites Include="@(_CompiledShader)" />
+    </ItemGroup>
+  </Target>
+
+  <!-- 增量编译：任一 GLSL 比 .spv 新才重新调 glslc。 -->
+  <Target Name="CompileShaders"
+          DependsOnTargets="IncludeCompiledShaders"
+          BeforeTargets="AssignTargetPaths"
+          Inputs="@(GlslShader)"
+          Outputs="@(_CompiledShader)">
+    <MakeDir Directories="$(IntermediateOutputPath)Shaders" />
+
+    <!-- 按源文件批处理：每个 .vert / .frag 各编译一次，产物名是 xxx.vert.spv / xxx.frag.spv -->
+    <Exec Command="&quot;$(GlslcPath)&quot; $(GlslCompileFlags) &quot;%(GlslShader.FullPath)&quot; -o &quot;$(IntermediateOutputPath)Shaders/%(GlslShader.Filename)%(GlslShader.Extension).spv&quot;" />
+  </Target>
+
+</Project>

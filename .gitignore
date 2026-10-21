@@ -1,0 +1,71 @@
+# ===== 构建输出（编译缓存）=====
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+artifacts/
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Pp]ublish/
+[Oo]ut/
+
+# ===== 编译中间产物 =====
+*.dll
+*.exe
+*.pdb
+*.mdb
+*.ilk
+*.obj
+*.iobj
+*.ipdb
+*.exp
+*.lib
+*.cache
+*.tlog
+*.lastbuildstate
+*.assemblyinfo
+*.GeneratedMSBuildEditorConfig.editorconfig
+*.nuget.g.props
+*.nuget.g.targets
+project.assets.json
+project.nuget.cache
+
+# ===== 着色器编译产物（由 csproj 的 CompileShaders 目标生成）=====
+*.spv
+
+# ===== 测试与覆盖率 =====
+[Tt]est[Rr]esult*/
+*.trx
+*.coverage
+*.coveragexml
+coverage*.json
+coverage*.xml
+coverage*.info
+BenchmarkDotNet.Artifacts/
+
+# ===== NuGet 缓存 =====
+packages/
+*.nupkg
+*.snupkg
+.nuget/
+
+# ===== IDE / 编辑器缓存 =====
+.vs/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.DotSettings.user
+*.swp
+*~
+
+# ===== 系统/临时文件 =====
+.DS_Store
+Thumbs.db
+desktop.ini
+*.tmp
+*.bak
+*.log
