@@ -592,6 +592,10 @@ public class Game_Vulkan
         oldSwapchain?.Destroy();
 
         // 交换链图像（VKSwapchain.Images）由驱动持有，我们不销毁它们，只给每张建一个视图。
+        Console.WriteLine($"surfaceFormat: {surfaceFormat}");
+        Console.WriteLine($"presentMode: {presentMode}");
+        Console.WriteLine($"extent: ({extent.Width}, {extent.Height})");
+        Console.WriteLine($"swapchainImageViewsCount: {Swapchain.Images.Count}");
         swapchainImageViews = new VKImageView[Swapchain.Images.Count];
         for (int i = 0; i < swapchainImageViews.Length; i++)
         {
