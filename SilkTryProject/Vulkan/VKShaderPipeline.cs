@@ -12,7 +12,7 @@ namespace SilkTry.Vulkan;
 /// 烘成驱动能直接吃的一个对象。之后录制命令时用 vkCmdBindPipeline 把它挂上去，再 vkCmdDraw。
 ///
 /// 归属：**父对象是 VKShaderPipelineLayout** —— 管线是"那份布局的管线"：布局描述它要接哪些资源
-///（push constant / 以后还有描述符集），管线正是按那份布局去接的。所以创建入口就在布局上
+///（描述符集布局 / push constant），管线正是按那份布局去接的。所以创建入口就在布局上
 ///（VKShaderPipelineLayout.CreateGraphicsPipeline）、登记表也在它那边（Valid 靠
 /// VKShaderPipelineLayout.IsShaderPipelineOfThis 反查）—— 同 VKBufferView 之于 VKBuffer、
 /// VKImageView 之于 VKImage。

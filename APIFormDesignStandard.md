@@ -571,10 +571,10 @@ public partial class NativeDevice              // ③ 执行方：设备级执�
 | 本文中性名称 | 本仓库实现 |
 |--------------|------------|
 | `Widget`（父包装类） | `VKInstance`、`VKPhysicalDevice`、`VKLogicalDevice`、`VKCommandPool`、`VKDeviceMemory`、`VKBuffer`、`VKImage`、`VKRenderPass`、`VKShaderPipelineLayout` |
-| `WidgetView`（子包装类） | `VKSurface`、`VKLogicalDevice`、`VKDeviceQueue`、`VKCommandPool`、`VKCommandBuffer`、`VKDeviceMemory`、`VKBuffer`、`VKBufferView`、`VKImage`、`VKImageView`、`VKRenderPass`、`VKFramebuffer`、`VKShaderPipelineLayout`、`VKShaderPipeline`、`VKShaderModule`、`VKSwapchain`、`VKFence`、`VKSemaphore` |
+| `WidgetView`（子包装类） | `VKSurface`、`VKLogicalDevice`、`VKDeviceQueue`、`VKCommandPool`、`VKCommandBuffer`、`VKDeviceMemory`、`VKBuffer`、`VKBufferView`、`VKImage`、`VKImageView`、`VKRenderPass`、`VKFramebuffer`、`VKDescriptorSetLayout`、`VKShaderPipelineLayout`、`VKShaderPipeline`、`VKShaderModule`、`VKSwapchain`、`VKFence`、`VKSemaphore` |
 | `WidgetView` 的多路径子类（§5.3） | `VKShaderPipeline`（`abstract`）→ `VKRenderPassShaderPipeline` / `VKDynamicShaderPipeline` |
 | `NativeDevice`（执行方） | `VKLogicalDevice` |
-| `NativeHandle` | `Silk.NET.Vulkan.Instance` / `SurfaceKHR` / `PhysicalDevice` / `Device` / `Queue` / `CommandPool` / `CommandBuffer` / `DeviceMemory` / `Buffer` / `BufferView` / `Image` / `ImageView` / `RenderPass` / `Framebuffer` / `PipelineLayout` / `Pipeline` / `ShaderModule` / `SwapchainKHR` / `Fence` / `Semaphore` |
+| `NativeHandle` | `Silk.NET.Vulkan.Instance` / `SurfaceKHR` / `PhysicalDevice` / `Device` / `Queue` / `CommandPool` / `CommandBuffer` / `DeviceMemory` / `Buffer` / `BufferView` / `Image` / `ImageView` / `RenderPass` / `Framebuffer` / `DescriptorSetLayout` / `PipelineLayout` / `Pipeline` / `ShaderModule` / `SwapchainKHR` / `Fence` / `Semaphore` |
 | `NativeApi` | `Silk.NET.Vulkan.Vk`（`Vk.GetApi()`） |
 | `AllocationCallbacks` | `Silk.NET.Vulkan.AllocationCallbacks` |
 
@@ -600,6 +600,7 @@ VKInstance                                   ← 根：PhysicalDevices 构造时
          │       └─ VKImageView              ← 父：VKImage（imageViews）
          ├─ VKRenderPass                     ← 父：VKLogicalDevice（renderPasses）
          │   └─ VKFramebuffer                ← 父：VKRenderPass（framebuffers）
+         ├─ VKDescriptorSetLayout            ← 父：VKLogicalDevice（descriptorSetLayouts）
          ├─ VKShaderPipelineLayout           ← 父：VKLogicalDevice（pipelineLayouts）
          │   └─ VKShaderPipeline (abstract)  ← 父：VKShaderPipelineLayout（shaderPipelines）
          │       ├─ VKRenderPassShaderPipeline  ← CreateRenderPassShaderPipeline
@@ -619,6 +620,7 @@ VKInstance                                   ← 根：PhysicalDevices 构造时
 VKSwapchain ──▶ VKSurface                   重建时复用同一个 surface；swapchain.Valid 要求 surface.Valid
 VKFramebuffer ──▶ VKImageView[]             附件视图；帧缓冲必须先于这些视图销毁
 VKRenderPassShaderPipeline ──▶ VKRenderPass 配合的渲染通道；通道必须先于管线销毁
+VKShaderPipelineLayout ──▶ VKDescriptorSetLayout[]  创建时给的那几个 set 布局；布局必须先于管线布局销毁
 VKShaderPipeline ──▶ VKShaderModule[]       Stages 引用的模块；模块必须先建、后毁
 VKCommandBuffer ──▶ 录制时用到的帧缓冲 / 渲染通道 / 管线 / 顶点缓冲 …
 ```
@@ -642,6 +644,7 @@ VKCommandBuffer ──▶ 录制时用到的帧缓冲 / 渲染通道 / 管线 / 
 | `VKRenderPass` | `VKLogicalDevice`（`renderPasses`） | `VKLogicalDevice.CreateRenderPass` | `Destroy` → `VKLogicalDevice.DestroyRenderPass` |
 | `VKFramebuffer` | `VKRenderPass`（`framebuffers`） | `VKRenderPass.CreateFramebuffer` | `Destroy` → `VKRenderPass.DestroyFramebuffer` |
 | `VKShaderPipelineLayout` | `VKLogicalDevice`（`pipelineLayouts`） | `VKLogicalDevice.CreateShaderPipelineLayout` | `Destroy` → `VKLogicalDevice.DestroyShaderPipelineLayout` |
+| `VKDescriptorSetLayout` | `VKLogicalDevice`（`descriptorSetLayouts`） | `VKLogicalDevice.CreateDescriptorSetLayout` | `Destroy` → `VKLogicalDevice.DestroyDescriptorSetLayout` |
 | `VKShaderPipeline` | `VKShaderPipelineLayout`（`shaderPipelines`） | `VKShaderPipelineLayout.CreateRenderPassShaderPipeline` / `CreateDynamicShaderPipeline` | `Destroy` → `VKShaderPipelineLayout.DestroyShaderPipeline` |
 | `VKShaderModule` | `VKLogicalDevice`（`shaderModules`） | `VKLogicalDevice.CreateShaderModule` | `Destroy` → `VKLogicalDevice.DestroyShaderModule` |
 | `VKSwapchain` | `VKLogicalDevice`（`swapchains`） | `VKLogicalDevice.TryCreateOrUpdateSwapchain` | `Destroy` → `VKLogicalDevice.DestroySwapchain` → `VKSurface.DestroySwapchain` |

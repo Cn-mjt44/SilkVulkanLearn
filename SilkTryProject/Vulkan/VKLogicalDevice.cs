@@ -91,8 +91,8 @@ public partial class VKLogicalDevice
     /// <summary>
     /// 销毁设备：先销毁本设备名下的全部子对象，最后才销毁设备本身。
     /// 顺序按 Vulkan 的依赖关系排：命令池（连带命令缓冲）→ 管线布局（连带图形管线）
-    /// → 渲染通道（连带帧缓冲）→ 交换链（连带图像视图）→ 内存（连带缓冲 / 图像 / 视图）
-    /// → 着色器模块 → 栅栏 → 信号量。
+    /// → 描述符集布局（管线布局的 pSetLayouts 引用着它们）→ 渲染通道（连带帧缓冲）
+    /// → 交换链（连带图像视图）→ 内存（连带缓冲 / 图像 / 视图）→ 着色器模块 → 栅栏 → 信号量。
     /// 单个子对象销毁失败不会中断流程，剩余的仍会继续销毁（best-effort）。
     /// </summary>
     public void Destroy()
@@ -117,6 +117,20 @@ public partial class VKLogicalDevice
             try
             {
                 pipelineLayout.Destroy();
+            }
+            catch
+            {
+                // 忽略单个子对象的销毁失败，保证其余子对象继续销毁。
+            }
+        }
+
+        // 描述符集布局被管线布局的 pSetLayouts 引用着（Vulkan 要求引用者先死），
+        // 所以排在管线布局全部销毁之后。
+        foreach (var descriptorSetLayout in descriptorSetLayouts.Keys.ToArray())
+        {
+            try
+            {
+                descriptorSetLayout.Destroy();
             }
             catch
             {

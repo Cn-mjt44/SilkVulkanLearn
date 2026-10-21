@@ -31,7 +31,8 @@ namespace SilkTry.Vulkan;
 ///   · 绘制：Draw / DrawIndexed / DrawIndirect / DrawIndexedIndirect；
 ///   · 传输：CopyBuffer / CopyBufferToImage / CopyImageToBuffer / CopyImage / BlitImage、FillBuffer / UpdateBuffer；
 ///   · 同步与次级缓冲：PipelineBarrier、ExecuteCommands。
-/// 描述符集的包装类（VKDescriptorSet / VKDescriptorSetLayout）还没有，所以 vkCmdBindDescriptorSets 留到那时再补。
+/// 描述符池 / 描述符集的包装类（VKDescriptorPool / VKDescriptorSet）还没有
+///（布局 VKDescriptorSetLayout 已经在），所以 vkCmdBindDescriptorSets 留到那时再补。
 ///
 /// 两种"用管线"的路径（对应管线的两个创建入口，见 VKShaderPipeline）：
 ///   · 固定渲染：管线由 CreateGraphicsRenderPassPipeline 建出来（类型 VKShaderPipeline_RenderPass，带 RenderPass），
