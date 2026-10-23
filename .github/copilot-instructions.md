@@ -10,11 +10,18 @@
 2. **句柄是 private** —— `public` 签名（参数 / 返回 / 字段）里不出现任何原生句柄；`internal` 可以。
 3. **归属靠登记表** —— `Valid` 必须反查父对象的登记表（`Parent.IsXxxOfThis(this)`，并带上父对象自身的 `Valid`），不信任手里的句柄。
 4. **创建在父对象、执行在持句柄者** —— `public CreateXxx` 在父包装类上；真正的原生调用在持有底层句柄的设备类里；参数含包装类数组时用 `internal static` 收口。
+   一个原生调用要读**多种**包装类的句柄时（例如 `vkUpdateDescriptorSets` 要描述符集 + 图像视图 + 采样器），
+   按句柄类型**逐层收口**：每一环只读自己那种句柄，其余句柄由上一环当参数传下来，最内层那个类发原生调用（规范 §3.3）。
 5. **销毁沿归属链上转、子先于父** —— 包装类只有无参 `Destroy()`，逐级 `internal bool DestroyXxx(...)`。
+   从池里分配的资源（如描述符集）跟着池走：池一销毁，里面的资源全部作废回收；
+   若池允许单独归还（带 `FreeDescriptorSetBit`），才逐套销毁，否则只清登记、由池一并回收。
+   池若有 `Reset()`，同样**先清登记**再调原生。
 6. **多条创建路径用子类表达** —— 同一个原生对象有互斥的几套创建参数时，用 `abstract` 基类 + 具体子类
    （路径专属元数据不为可空），父对象上每条路径一个 `public` 工厂；消费方按类型分派时 `switch` 必须有 `default`。
 
 参考实现：[`SilkTryProject/Vulkan/VKBufferView.cs`](../SilkTryProject/Vulkan/VKBufferView.cs)（最简形态）、
 [`SilkTryProject/Vulkan/VKShaderPipelineLayout.cs`](../SilkTryProject/Vulkan/VKShaderPipelineLayout.cs)（多级形态）、
 [`SilkTryProject/Vulkan/VKShaderPipeline.cs`](../SilkTryProject/Vulkan/VKShaderPipeline.cs)（多路径形态）、
-[`SilkTryProject/Vulkan/VKCommandBuffer.cs`](../SilkTryProject/Vulkan/VKCommandBuffer.cs)（有状态录制）。
+[`SilkTryProject/Vulkan/VKCommandBuffer.cs`](../SilkTryProject/Vulkan/VKCommandBuffer.cs)（有状态录制）、
+[`SilkTryProject/Vulkan/VKDescriptorPool.cs`](../SilkTryProject/Vulkan/VKDescriptorPool.cs) + [`VKDescriptorSet.cs`](../SilkTryProject/Vulkan/VKDescriptorSet.cs)（池分配的资源 + 多种句柄逐层收口）、
+[`SilkTryProject/Vulkan/VKDescriptorSetLayout.cs`](../SilkTryProject/Vulkan/VKDescriptorSetLayout.cs)（一个类承接多条收口）。

@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.Runtime.InteropServices;
 using Silk.NET.Core.Native;
@@ -90,14 +89,15 @@ public partial class VKLogicalDevice
 
     /// <summary>
     /// 销毁设备：先销毁本设备名下的全部子对象，最后才销毁设备本身。
-    /// 顺序按 Vulkan 的依赖关系排：命令池（连带命令缓冲）→ 管线布局（连带图形管线）
-    /// → 描述符集布局（管线布局的 pSetLayouts 引用着它们）→ 渲染通道（连带帧缓冲）
+    /// 顺序按 Vulkan 的依赖关系排：命令池（连带命令缓冲）
+    /// → 管线布局（连带图形管线）→ 描述符集布局（连带描述符池与描述符集 —— 布局是池的父对象）
+    /// → 采样器（描述符集布局的不可变采样器烘进了布局里）→ 渲染通道（连带帧缓冲）
     /// → 交换链（连带图像视图）→ 内存（连带缓冲 / 图像 / 视图）→ 着色器模块 → 栅栏 → 信号量。
     /// 单个子对象销毁失败不会中断流程，剩余的仍会继续销毁（best-effort）。
     /// </summary>
     public void Destroy()
     {
-        // 命令池最先：命令缓冲里录着对帧缓冲 / 渲染通道 / 管线 / 顶点缓冲的引用，
+        // 命令池最先：命令缓冲里录着对帧缓冲 / 渲染通道 / 管线 / 描述符集 / 顶点缓冲的引用，
         // 它们必须先被释放，后面那些对象才不是"仍在使用中"。
         foreach (var commandPool in commandPools.Keys.ToArray())
         {
@@ -126,11 +126,28 @@ public partial class VKLogicalDevice
 
         // 描述符集布局被管线布局的 pSetLayouts 引用着（Vulkan 要求引用者先死），
         // 所以排在管线布局全部销毁之后。
+        // 描述符池排在描述符集布局**里面**：布局的 Destroy() 先销毁名下的池（连带集），再销毁布局自己 ——
+        // 命令缓冲已经先删了，所以这里不用担心"集还被录制中的命令引用"。
         foreach (var descriptorSetLayout in descriptorSetLayouts.Keys.ToArray())
         {
             try
             {
                 descriptorSetLayout.Destroy();
+            }
+            catch
+            {
+                // 忽略单个子对象的销毁失败，保证其余子对象继续销毁。
+            }
+        }
+
+        // 采样器排在描述符集布局之后：布局里的不可变采样器虽然一建好就烘进去了，
+        // 但"布局先死、采样器后死"是保守且一定安全的顺序（描述符集引用的采样器也都在它之前销毁 ——
+        // 集挂在池上，池在布局的 Destroy() 里先被销毁）。
+        foreach (var sampler in samplers.Keys.ToArray())
+        {
+            try
+            {
+                sampler.Destroy();
             }
             catch
             {

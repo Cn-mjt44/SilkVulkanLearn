@@ -10,6 +10,7 @@ using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.EXT;
 using Silk.NET.Windowing;
 using SilkTry.Vulkan;
+using SilkTry.Vulkan.ManagedStruct;
 
 namespace SilkTry;
 

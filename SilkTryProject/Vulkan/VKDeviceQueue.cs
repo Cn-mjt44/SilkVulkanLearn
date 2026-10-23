@@ -3,6 +3,7 @@ using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.EXT;
 using Silk.NET.Vulkan.Extensions.KHR;
+using SilkTry.Vulkan.ManagedStruct;
 
 // 隐式 using 带进来的 System.Threading 里也有一个 Semaphore，和 Vulkan 的同名，必须显式指向后者
 //（同 VKSemaphore.cs / VKSwapchain.cs）。

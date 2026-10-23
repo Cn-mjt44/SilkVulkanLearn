@@ -1,6 +1,6 @@
 using Silk.NET.Vulkan;
 
-namespace SilkTry.Vulkan;
+namespace SilkTry.Vulkan.ManagedStruct;
 
 /// <summary>
 /// 一次稀疏绑定（VkBindSparseInfo）的**无指针版**。

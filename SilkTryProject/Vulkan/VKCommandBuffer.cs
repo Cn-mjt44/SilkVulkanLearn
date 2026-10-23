@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
+using System.Collections.ObjectModel;
 using Silk.NET.Vulkan;
 using Silk.NET.Vulkan.Extensions.KHR;
+using SilkTry.Vulkan.ManagedStruct;
 
 namespace SilkTry.Vulkan;
 
@@ -27,12 +29,13 @@ namespace SilkTry.Vulkan;
 ///   · 管线与状态：BindPipeline、SetViewport / SetScissor、SetLineWidth / SetDepthBias / SetBlendConstants、
 ///     SetDepthTestEnable / SetDepthWriteEnable / SetDepthCompareOp、SetStencilTestEnable / SetStencilOp、
 ///     SetCullMode / SetFrontFace / SetPrimitiveTopology；
-///   · 资源绑定：BindVertexBuffers / BindIndexBuffer、PushConstants；
+///   · 资源绑定：BindVertexBuffers / BindIndexBuffer、BindDescriptorSets、PushConstants；
 ///   · 绘制：Draw / DrawIndexed / DrawIndirect / DrawIndexedIndirect；
 ///   · 传输：CopyBuffer / CopyBufferToImage / CopyImageToBuffer / CopyImage / BlitImage、FillBuffer / UpdateBuffer；
 ///   · 同步与次级缓冲：PipelineBarrier、ExecuteCommands。
-/// 描述符池 / 描述符集的包装类（VKDescriptorPool / VKDescriptorSet）还没有
-///（布局 VKDescriptorSetLayout 已经在），所以 vkCmdBindDescriptorSets 留到那时再补。
+/// 本类的划界线（描述符那一套在哪）：描述符池 / 描述符集由 VKDescriptorPool、VKDescriptorSet 负责
+/// （分配、vkUpdateDescriptorSets 的 WriteXxx / CopyTo 都在那边），本类只管录制时的
+/// vkCmdBindDescriptorSets（入口是 BindDescriptorSets）。
 ///
 /// 两种"用管线"的路径（对应管线的两个创建入口，见 VKShaderPipeline）：
 ///   · 固定渲染：管线由 CreateGraphicsRenderPassPipeline 建出来（类型 VKShaderPipeline_RenderPass，带 RenderPass），
@@ -651,6 +654,7 @@ public partial class VKCommandBuffer
     /// <summary>
     /// vkCmdPushConstants：把一小段数据直接推进管线（教程《Uniform buffer》之后的 push constant 用法）。
     ///
+    /// 对应 GLSL 的 `layout(push_constant) uniform Push { ... } pc;`（它不进描述符集 / 描述符池）。
     /// data 的布局必须和布局里声明的 PushConstantRange（stageFlags / offset / size）对得上；
     /// offset 是相对于该范围的起点。Vulkan 要求数据长度是 4 的倍数。
     ///
@@ -674,6 +678,42 @@ public partial class VKCommandBuffer
         }
 
         layout.PushConstants(this, CheckedRecordingHandle, stageFlags, offset, data);
+    }
+
+    /// <summary>
+    /// vkCmdBindDescriptorSets：录制时把描述符集挂到当前管线上（教程《Descriptor pool and sets》的最后一步）。
+    ///
+    /// 参数：
+    ///   bindPoint      —— 绑给图形还是计算管线（要和 BindPipeline 时一致）；
+    ///   layout         —— 当前管线用的那份**管线布局**（描述符集就是按它的 set 顺序挂上去的）；
+    ///   firstSet       —— descriptorSets[0] 对应布局里的第几个 set（教程只有一套，所以是 0；
+    ///                     对着 GLSL 的 layout(set = N)，不写 set 时是 0）；
+    ///   descriptorSets —— 要绑的集，顺序对应布局里第 firstSet、firstSet+1……个 set；
+    ///   dynamicOffsets —— Dynamic 描述符（UniformBufferDynamic / StorageBufferDynamic）的偏移，不传 = 没有
+    ///                     （GLSL 里没有 Dynamic 的写法，这种类型是 API 侧选的）。
+    ///
+    /// 句柄：命令缓冲句柄是本类自己的；布局句柄由 VKShaderPipelineLayout 那边读、各集句柄由
+    /// VKDescriptorSet 的收口读（"谁的句柄类型，谁就在自己的类里读写它"）。
+    /// 与 BindPipeline 不同，这里不要求处在渲染范围内 —— 计算管线在渲染范围外绑集是合法的。
+    /// </summary>
+    public void BindDescriptorSets(
+        PipelineBindPoint bindPoint,
+        VKShaderPipelineLayout layout,
+        uint firstSet,
+        VKDescriptorSet[] descriptorSets,
+        uint[]? dynamicOffsets = null)
+    {
+        if (layout == null)
+        {
+            throw new ArgumentNullException(nameof(layout));
+        }
+
+        if (descriptorSets == null || descriptorSets.Length == 0)
+        {
+            throw new ArgumentException("At least one descriptor set must be provided.", nameof(descriptorSets));
+        }
+
+        layout.BindDescriptorSets(this, CheckedRecordingHandle, bindPoint, firstSet, descriptorSets, dynamicOffsets);
     }
 
     /// <summary>
@@ -1838,8 +1878,52 @@ public partial class VKImage
 
 public partial class VKShaderPipelineLayout
 {
-    private readonly static Vk VK = Vk.GetApi();
 
+    /// <summary>
+    /// vkCmdBindDescriptorSets 的"管线布局这一环"：本类读自己的 PipelineLayout 句柄，
+    /// 命令缓冲句柄由 VKCommandBuffer 当参数传下来，各描述符集的句柄再交给 VKDescriptorSet 的收口读。
+    /// 调用链：
+    ///   VKCommandBuffer.BindDescriptorSets(…)   ← public、零裸句柄
+    ///     → 本方法                             读自己的布局句柄（这就是"授权"）
+    ///       → VKDescriptorSet.BindDescriptorSets(…)   internal static 收口：读各集的私有句柄 + 执行
+    /// 参数（bindPoint / firstSet / dynamicOffsets）原样对应 vulkan 的那几个：
+    ///   bindPoint      —— 绑给图形还是计算管线；
+    ///   firstSet       —— descriptorSets[0] 对应管线布局里的第几个 set（对着 GLSL 的 layout(set = N)）；
+    ///   dynamicOffsets —— Dynamic 描述符（UniformBufferDynamic / StorageBufferDynamic）用的偏移数组，
+    ///                     不传 = 没有动态描述符（GLSL 没有 Dynamic 写法，是 API 侧选的类型）。
+    /// </summary>
+    internal void BindDescriptorSets(
+        VKCommandBuffer commandBuffer,
+        CommandBuffer commandBufferHandle,
+        PipelineBindPoint bindPoint,
+        uint firstSet,
+        VKDescriptorSet[] descriptorSets,
+        uint[]? dynamicOffsets)
+    {
+        PipelineLayout layoutHandle = CheckedHandle;
+
+        if (!commandBuffer.IsHandleOfThis(commandBufferHandle))
+        {
+            throw new ArgumentException(
+                "The provided command buffer handle is not associated with the given VKCommandBuffer.");
+        }
+
+        if (commandBuffer.Parent.Parent != Parent)
+        {
+            throw new ArgumentException(
+                "The provided command buffer is not from the logical device that owns the pipeline layout.");
+        }
+
+        VKDescriptorSet.BindDescriptorSets(
+            commandBuffer,
+            commandBufferHandle,
+            this,
+            layoutHandle,
+            bindPoint,
+            firstSet,
+            descriptorSets,
+            dynamicOffsets);
+    }
     /// <summary>
     /// vkCmdPushConstants 的最后一环：本类读自己的 PipelineLayout 句柄，
     /// 命令缓冲句柄由 VKCommandBuffer 当参数传下来。
@@ -1875,5 +1959,86 @@ public partial class VKShaderPipelineLayout
                 (uint)data.Length,
                 pData);
         }
+    }
+}
+
+public partial class VKDescriptorSet
+{
+    /// <summary>
+    /// vkCmdBindDescriptorSets 的收口（参数里是包装类数组，按规范放在句柄所属的类里做 internal static）：
+    /// 逐个读各描述符集自己的 CheckedHandle，本类不把任何句柄交给外面。
+    /// PipelineLayout 句柄由 VKShaderPipelineLayout 当参数传下来（它才是那个句柄的持有者）。
+    /// firstSet 对应 GLSL 的 layout(set = N)：descriptorSets[0] 挂到第 firstSet 个 set 上。
+    /// </summary>
+    internal static void BindDescriptorSets(
+        VKCommandBuffer commandBuffer,
+        CommandBuffer commandBufferHandle,
+        VKShaderPipelineLayout pipelineLayout,
+        PipelineLayout layoutHandle,
+        PipelineBindPoint bindPoint,
+        uint firstSet,
+        VKDescriptorSet[] descriptorSets,
+        uint[]? dynamicOffsets)
+    {
+        VKLogicalDevice device = commandBuffer.Parent.Parent;
+
+        if (!commandBuffer.IsHandleOfThis(commandBufferHandle))
+        {
+            throw new ArgumentException(
+                "The provided command buffer handle is not associated with the given VKCommandBuffer.");
+        }
+
+        ReadOnlyCollection<VKDescriptorSetLayout>? pipelineSetLayouts = pipelineLayout.DescriptorSetLayouts;
+        if (pipelineSetLayouts == null)
+        {
+            throw new ArgumentException(
+                "The provided pipeline layout was created without descriptor set layouts.",
+                nameof(pipelineLayout));
+        }
+
+        DescriptorSet[] setHandles = new DescriptorSet[descriptorSets.Length];
+        for (int i = 0; i < descriptorSets.Length; i++)
+        {
+            VKDescriptorSet descriptorSet = descriptorSets[i];
+            if (descriptorSet == null)
+            {
+                throw new ArgumentException("A descriptor set cannot be null.", nameof(descriptorSets));
+            }
+
+            if (descriptorSet.Device != device)
+            {
+                throw new ArgumentException(
+                    "The provided descriptor set is not from the logical device that owns the command buffer.",
+                    nameof(descriptorSets));
+            }
+
+            // Vulkan 要求绑上去的集，其布局与管线布局里第 firstSet + i 个 set 的布局"matching"
+            //（同一份，或定义完全相同的另一份）—— 详见 VKDescriptorSetLayout.IsCompatibleWith。
+            uint setIndex = firstSet + (uint)i;
+            if (setIndex >= pipelineSetLayouts.Count)
+            {
+                throw new ArgumentException(
+                    $"The pipeline layout only declares {pipelineSetLayouts.Count} descriptor set(s); " +
+                    $"the descriptor set at index {setIndex} (firstSet + {i}) does not exist in it.",
+                    nameof(firstSet));
+            }
+
+            if (!descriptorSet.Layout.IsCompatibleWith(pipelineSetLayouts[(int)setIndex]))
+            {
+                throw new ArgumentException(
+                    "The provided descriptor set was allocated from a layout that is not compatible with the pipeline layout.",
+                    nameof(descriptorSets));
+            }
+
+            setHandles[i] = descriptorSet.CheckedHandle;
+        }
+
+        VK.CmdBindDescriptorSets(
+            commandBufferHandle,
+            bindPoint,
+            layoutHandle,
+            firstSet,
+            setHandles,
+            dynamicOffsets ?? Array.Empty<uint>());
     }
 }

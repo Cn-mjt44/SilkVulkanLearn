@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using Silk.NET.Core.Native;
 using Silk.NET.Vulkan;
+using SilkTry.Vulkan.ManagedStruct;
 
 namespace SilkTry.Vulkan;
 

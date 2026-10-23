@@ -1,6 +1,6 @@
 using Silk.NET.Vulkan;
 
-namespace SilkTry.Vulkan;
+namespace SilkTry.Vulkan.ManagedStruct;
 
 /// <summary>
 /// 动态渲染（Vulkan 1.3 核心 / VK_KHR_dynamic_rendering 扩展）里 VkRenderingInfo 的**无指针版**。

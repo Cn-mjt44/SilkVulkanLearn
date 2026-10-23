@@ -2,7 +2,7 @@ using System.Collections.ObjectModel;
 using System.Runtime.InteropServices;
 using Silk.NET.Vulkan;
 
-namespace SilkTry.Vulkan;
+namespace SilkTry.Vulkan.ManagedStruct;
 
 /// <summary>
 /// 子通道描述（教程《Render passes》章节的 ③）的**无指针版**。

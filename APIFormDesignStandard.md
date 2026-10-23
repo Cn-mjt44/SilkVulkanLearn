@@ -166,6 +166,30 @@ WidgetView.Destroy()
 
 **铁律**：任何对象都不"返回"自己的句柄；只允许把 `CheckedHandle` **当参数往下传**（传入正确值 = 授权），下一环再复核一次。
 
+### 3.3 一个调用要读多种句柄类型时：逐层收口
+
+有些原生调用需要**不止一种**包装类的句柄。典型是 `vkUpdateDescriptorSets` 写"图像"那一路：
+它同时要描述符集、图像视图、采样器三种句柄，而这三者分别是三个类型的私有字段 ——
+没有任何一个类能同时读到它们（`private` 是**类型级**可见性）。
+
+做法：沿着"谁持有这种句柄"串成一条链，**每一环只读自己那种句柄**，其余句柄由上一环当参数传下来：
+
+```text
+【一个原生调用、三种句柄】
+VKDescriptorSet.WriteImages(...)                     // public：持描述符集句柄，做"绑定级"校验
+  → NativeDevice.UpdateDescriptorSet_Images(...)      // 设备：补上 Device 句柄（它才持有）
+    → VKImageView.WriteDescriptorSets(...)            // internal static：读视图句柄
+      → VKSampler.WriteDescriptorSets(...)            // internal static：读采样器句柄，最后发原生调用
+```
+
+规则：
+
+1. 每一环都对传下来的句柄**再复核一次**（`IsHandleOfThis` / 设备归属），不因为"上游校验过"就跳过；
+2. 收口方法一律 `internal static`（入参里已经有裸句柄），参数按"实例 + 它的句柄"成对出现；
+3. 链条顺序按"最内层那个类要读哪种句柄"排；**最内层的类负责发原生调用**，中间各环只做校验 / 组装；
+4. 不要把多种句柄塞进一个类去图省事 —— 那是 §13 的拆类信号，这里的做法是"拆调用链"而不是"拆类型"；
+5. 中间环转发时不要顺手把上游句柄缓存下来：句柄只在本次调用里流动。
+
 ---
 
 ## 4. 父对象的登记表
@@ -208,6 +232,9 @@ public WidgetView CreateWidgetView(
 
 - 参数对应原生 `create-info` 的字段；
 - **用 `T[]?` 代替"指针 + count"**（`count` 由数组长度推导，不单独暴露）；
+- **用字典代替"自带编号的结构体数组"**：条目自带 key 时（例如描述符的 binding 号），
+  `public` 参数用 `IReadOnlyDictionary<TKey, TValue>`，包装类内部**复制一份**再持有 / 归一化，
+  不把调用方的字典当自己的存储（例：`VKDescriptorSetLayout.CreateDescriptorSetLayout`）；
 - 必填项不给默认值；标志枚举默认 `None`；
 - `allocationCallbacks` 永远最后一个、默认 `null`；
 - 不接收裸句柄，也不返回裸句柄。
@@ -227,6 +254,13 @@ public WidgetView CreateWidgetView(...)
 - ① 之前如需用到父对象的句柄，直接 `CheckedHandle`（同时完成一次有效性检查）。
 - 需要"一键创建"时，可以再加一个 `public static` 便捷工厂（`Widget.CreateWidgetView(device, …)`），但内部必须走同一套流程。
 - **多对象创建要回滚**：一次原生流程里建了多个对象，后一步失败必须 try/catch 销毁已建的，再抛出。
+  （`VKDescriptorSetLayout.CreateDescriptorPool` 就是例子：先 `vkCreateDescriptorPool`、再 `vkAllocateDescriptorSets`，
+  后者失败时先 `vkDestroyDescriptorPool` 再 rethrow。`vkAllocateDescriptorSets` 本身"要么全部分配成功、要么一套都没有"，
+  失败时不需要逐套回滚。）
+- **从池里分配的对象**（命令缓冲、描述符集）入口同样在父对象上，只是名字用 `AllocateXxx`；
+  分配可能失败（池的配额不够 / 碎片化），失败同样抛 `NotSupportedException`，返回值是非空数组。
+  （`VKDescriptorSet` 是"建池即建集"的特例：没有独立的分配入口，集在 `CreateDescriptorPool` 里一次分完，
+  见 `VKDescriptorPool.DescriptorSets`。）
 
 ### 5.3 多条创建路径：抽象基类 + 具体子类
 
@@ -301,6 +335,13 @@ internal unsafe bool DestroyWidgetView(WidgetView widgetView, NativeHandle handl
 - 每个 `Destroy()` / `DestroyXxx` 的文档注释都必须写明它按什么顺序销毁哪些子对象。
 - 若资源自身有硬性先后（例如 A 必须比 B 晚死），**用归属链表达它**：把被依赖者升级为父对象（见 §13），这样父对象的 `Destroy()` 会自然先销毁子对象。
 - 不归我们销毁的资源（例如交换链图像，见 §6.4）不能放进"自动销毁"的循环里；它们的子对象（如图像视图）仍需在父对象销毁前单独清掉。
+- 从**池里分配**的资源（例如描述符集，见 `VKDescriptorPool`）跟着池走：池这一层只清登记 / 直接销毁池本身 ——
+  它们由 `vkDestroyDescriptorPool` 一起回收，和交换链图像是同一种"不归我们逐个销毁"。
+  （本仓库的集在池创建时一次性分配、没有单独归还的入口，所以不需要 `FreeDescriptorSetBit` 那条分支。）
+- 若某种池**允许**单独归还（本仓库目前没有这种用例），必须有对应的 `free` 分支：
+  带 `FreeDescriptorSetBit` 时逐套调用子对象的 `Destroy()`，否则只清登记。
+- 池若有 `Reset()`（本仓库目前没暴露），它不是销毁，但同样会让名下资源全部失效：**先清登记表**
+  （那些对象的 `Valid` 立刻变 false），再调原生，顺序反了会让已作废的对象仍然"看起来有效"。
 
 父对象一侧的固定写法（先快照登记表，避免子对象在销毁过程中摘登记影响遍历；不判断 `Valid`，每个子对象的销毁都用 `try-catch` 包住，单个失败不阻断其余对象）：
 
@@ -488,7 +529,11 @@ public partial class NativeDevice              // ③ 执行方：设备级执�
 
 - 用 `partial` 把"同一个功能"的三层放在一起，比按类型拆文件更好读；
 - 该类型已经很大时，才拆成独立文件；
-- `#region` 只用于执行方（设备类）并按功能命名，不要给每个方法都套 region。
+- `#region` 只用于执行方（设备类）并按功能命名，不要给每个方法都套 region；
+- **收口用的 `partial class Xxx` 写在"被创建 / 被操作的那个对象"所属的文件里**，不写在句柄所属类型的文件里：
+  `VKImageView.CreateFramebuffer` 在 `VKFramebuffer.cs`、`VKShaderModule.CreateGraphicsPipeline` 在 `VKShaderPipeline.cs`、
+  `VKSampler.WriteDescriptorSets` / `VKBuffer.WriteDescriptorSets` 在 `VKDescriptorSet.cs`。
+  这样"一个功能一个文件"仍然成立：打开这个文件，就能看到它的创建 / 写入 / 销毁在各层是怎么接起来的。
 
 ---
 
@@ -551,10 +596,14 @@ public partial class NativeDevice              // ③ 执行方：设备级执�
 - [ ] `Destroy()` 无参，且通过父对象转发
 - [ ] 父对象的 `Destroy()` 先销毁登记表里的全部子对象，再销毁自己
 - [ ] 每级 `DestroyXxx` 返回 `bool`，先校验再摘登记
-- [ ] 登记表在父对象上，`value` 存 `AllocationCallbacks?`
+- [ ] 登记表在父对象上，`value` 存 `AllocationCallbacks?`（池里分配、不能单独归还的资源用 `byte` 或"创建时切出来的那批集"当证据）
 - [ ] 执行方复核了句柄归属
 - [ ] 多对象创建失败时已回滚
-- [ ] 参数含包装类数组时，用的是 `internal static` 收口
+- [ ] 参数含包装类数组 / 包装类字典时，用的是 `internal static` 收口
+- [ ] 一个原生调用要读多种包装类型的句柄时，按句柄类型**逐层收口**（§3.3），每环只读自己那种句柄
+- [ ] 从池里分配的对象：池**允许单独归还**时，`Destroy()` 前先问"这个池允许吗"（不允许就抛 `InvalidOperationException`，不是静默失败）；
+      不允许单独归还时（如本仓库的描述符集）干脆不提供 `Destroy()`，随池一起回收；池若有 `Reset()`，先清登记再调原生
+- [ ] 集合类参数在 `public` 边界上被复制（字典 / 数组不被包装类持有、也不被就地修改）
 - [ ] 一处资源若有两种所有者，用 `I<子类型>Parent` 接口 + 非空 `Parent`，销毁处用 `is` 判断（不是判空）
 - [ ] 类注释写了归属 / 分工 / 划界线
 - [ ] 文档写明了生命周期顺序
@@ -570,11 +619,11 @@ public partial class NativeDevice              // ③ 执行方：设备级执�
 
 | 本文中性名称 | 本仓库实现 |
 |--------------|------------|
-| `Widget`（父包装类） | `VKInstance`、`VKPhysicalDevice`、`VKLogicalDevice`、`VKCommandPool`、`VKDeviceMemory`、`VKBuffer`、`VKImage`、`VKRenderPass`、`VKShaderPipelineLayout` |
-| `WidgetView`（子包装类） | `VKSurface`、`VKLogicalDevice`、`VKDeviceQueue`、`VKCommandPool`、`VKCommandBuffer`、`VKDeviceMemory`、`VKBuffer`、`VKBufferView`、`VKImage`、`VKImageView`、`VKRenderPass`、`VKFramebuffer`、`VKDescriptorSetLayout`、`VKShaderPipelineLayout`、`VKShaderPipeline`、`VKShaderModule`、`VKSwapchain`、`VKFence`、`VKSemaphore` |
+| `Widget`（父包装类） | `VKInstance`、`VKPhysicalDevice`、`VKLogicalDevice`、`VKCommandPool`、`VKDescriptorPool`、`VKDeviceMemory`、`VKBuffer`、`VKImage`、`VKRenderPass`、`VKShaderPipelineLayout` |
+| `WidgetView`（子包装类） | `VKSurface`、`VKLogicalDevice`、`VKDeviceQueue`、`VKCommandPool`、`VKCommandBuffer`、`VKDeviceMemory`、`VKBuffer`、`VKBufferView`、`VKImage`、`VKImageView`、`VKRenderPass`、`VKFramebuffer`、`VKDescriptorSetLayout`、`VKDescriptorPool`、`VKDescriptorSet`、`VKSampler`、`VKShaderPipelineLayout`、`VKShaderPipeline`、`VKShaderModule`、`VKSwapchain`、`VKFence`、`VKSemaphore` |
 | `WidgetView` 的多路径子类（§5.3） | `VKShaderPipeline`（`abstract`）→ `VKRenderPassShaderPipeline` / `VKDynamicShaderPipeline` |
 | `NativeDevice`（执行方） | `VKLogicalDevice` |
-| `NativeHandle` | `Silk.NET.Vulkan.Instance` / `SurfaceKHR` / `PhysicalDevice` / `Device` / `Queue` / `CommandPool` / `CommandBuffer` / `DeviceMemory` / `Buffer` / `BufferView` / `Image` / `ImageView` / `RenderPass` / `Framebuffer` / `DescriptorSetLayout` / `PipelineLayout` / `Pipeline` / `ShaderModule` / `SwapchainKHR` / `Fence` / `Semaphore` |
+| `NativeHandle` | `Silk.NET.Vulkan.Instance` / `SurfaceKHR` / `PhysicalDevice` / `Device` / `Queue` / `CommandPool` / `CommandBuffer` / `DeviceMemory` / `Buffer` / `BufferView` / `Image` / `ImageView` / `RenderPass` / `Framebuffer` / `DescriptorPool` / `DescriptorSetLayout` / `DescriptorSet` / `Sampler` / `PipelineLayout` / `Pipeline` / `ShaderModule` / `SwapchainKHR` / `Fence` / `Semaphore` |
 | `NativeApi` | `Silk.NET.Vulkan.Vk`（`Vk.GetApi()`） |
 | `AllocationCallbacks` | `Silk.NET.Vulkan.AllocationCallbacks` |
 
@@ -592,6 +641,12 @@ VKInstance                                   ← 根：PhysicalDevices 构造时
          │                                     随设备创建一次性取出，无 Destroy
          ├─ VKCommandPool                    ← 父：VKLogicalDevice（commandPools）
          │   └─ VKCommandBuffer              ← 父：VKCommandPool（commandBuffers）
+         ├─ VKDescriptorSetLayout            ← 父：VKLogicalDevice（descriptorSetLayouts）
+         │   └─ VKDescriptorPool             ← 父：VKDescriptorSetLayout（descriptorPools）
+         │       │                             一个池只服务一份布局
+         │       └─ VKDescriptorSet          ← 父：VKDescriptorPool（DescriptorSets）
+         │                                     建池时一次性分配，随池一起销毁（没有单独 Destroy）
+         ├─ VKSampler                        ← 父：VKLogicalDevice（samplers）
          ├─ VKDeviceMemory                   ← 父：VKLogicalDevice（memories）
          │   ├─ VKBuffer                     ← 父：VKDeviceMemory（buffers）
          │   │   └─ VKBufferView             ← 父：VKBuffer（bufferViews）
@@ -600,7 +655,6 @@ VKInstance                                   ← 根：PhysicalDevices 构造时
          │       └─ VKImageView              ← 父：VKImage（imageViews）
          ├─ VKRenderPass                     ← 父：VKLogicalDevice（renderPasses）
          │   └─ VKFramebuffer                ← 父：VKRenderPass（framebuffers）
-         ├─ VKDescriptorSetLayout            ← 父：VKLogicalDevice（descriptorSetLayouts）
          ├─ VKShaderPipelineLayout           ← 父：VKLogicalDevice（pipelineLayouts）
          │   └─ VKShaderPipeline (abstract)  ← 父：VKShaderPipelineLayout（shaderPipelines）
          │       ├─ VKRenderPassShaderPipeline  ← CreateRenderPassShaderPipeline
@@ -614,6 +668,12 @@ VKInstance                                   ← 根：PhysicalDevices 构造时
          └─ VKSemaphore                      ← 父：VKLogicalDevice（semaphores）
 ```
 
+> 这棵树只表达**归属**（谁登记谁、`Valid` 反查谁），**不是**销毁顺序。
+> 设备级销毁顺序按 Vulkan 的依赖关系排在 `VKLogicalDevice.Destroy()` 里：
+> 命令池（连带命令缓冲）→ 管线布局（连带管线）→ 描述符集布局（连带描述符池与描述符集）→ 采样器
+> → 渲染通道（连带帧缓冲）→ 交换链（连带图像视图）→ 内存（连带缓冲 / 图像 / 视图）→ 着色器模块 → 栅栏 → 信号量。
+> 判据只有一条：**引用者比被引用者先死**。
+
 **引用边**（不是归属：只为校验 / 使用，不参与销毁顺序）：
 
 ```text
@@ -621,6 +681,10 @@ VKSwapchain ──▶ VKSurface                   重建时复用同一个 surfa
 VKFramebuffer ──▶ VKImageView[]             附件视图；帧缓冲必须先于这些视图销毁
 VKRenderPassShaderPipeline ──▶ VKRenderPass 配合的渲染通道；通道必须先于管线销毁
 VKShaderPipelineLayout ──▶ VKDescriptorSetLayout[]  创建时给的那几个 set 布局；布局必须先于管线布局销毁
+VKDescriptorSetLayout ──▶ VKSampler[]       绑定里的不可变采样器；保守起见排在布局之后销毁
+VKDescriptorSet ──▶ VKDescriptorSetLayout   按它切出来的；布局销毁后这套集就不能再更新了
+VKDescriptorSet ──▶ VKBuffer / VKImageView / VKBufferView / VKSampler   写入的资源；它们要活得比集久
+VKCommandBuffer ──▶ VKDescriptorSet[]       录制时绑定的集；集要活得比命令执行久
 VKShaderPipeline ──▶ VKShaderModule[]       Stages 引用的模块；模块必须先建、后毁
 VKCommandBuffer ──▶ 录制时用到的帧缓冲 / 渲染通道 / 管线 / 顶点缓冲 …
 ```
@@ -643,8 +707,11 @@ VKCommandBuffer ──▶ 录制时用到的帧缓冲 / 渲染通道 / 管线 / 
 | `VKImageView` | `VKImage`（`imageViews`） | `VKImage.CreateImageView` | `Destroy` → `VKImage.DestroyImageView` |
 | `VKRenderPass` | `VKLogicalDevice`（`renderPasses`） | `VKLogicalDevice.CreateRenderPass` | `Destroy` → `VKLogicalDevice.DestroyRenderPass` |
 | `VKFramebuffer` | `VKRenderPass`（`framebuffers`） | `VKRenderPass.CreateFramebuffer` | `Destroy` → `VKRenderPass.DestroyFramebuffer` |
+| `VKDescriptorSetLayout` | `VKLogicalDevice`（`descriptorSetLayouts`） | `VKLogicalDevice.CreateDescriptorSetLayout` | `Destroy`（先销毁名下池，连带集）→ `VKLogicalDevice.DestroyDescriptorSetLayout` |
+| `VKDescriptorPool` | `VKDescriptorSetLayout`（`descriptorPools`） | `VKDescriptorSetLayout.CreateDescriptorPool` | `Destroy` → `VKDescriptorSetLayout.DestroyDescriptorPool` → `VKLogicalDevice.DestroyDescriptorPool` |
+| `VKDescriptorSet` | `VKDescriptorPool`（`DescriptorSets`） | 随池创建一次性分配（`VKDescriptorSetLayout.CreateDescriptorPool`） | 无单独 `Destroy`：随池回收（`vkDestroyDescriptorPool` 一起带走） |
+| `VKSampler` | `VKLogicalDevice`（`samplers`） | `VKLogicalDevice.CreateSampler` | `Destroy` → `VKLogicalDevice.DestroySampler` |
 | `VKShaderPipelineLayout` | `VKLogicalDevice`（`pipelineLayouts`） | `VKLogicalDevice.CreateShaderPipelineLayout` | `Destroy` → `VKLogicalDevice.DestroyShaderPipelineLayout` |
-| `VKDescriptorSetLayout` | `VKLogicalDevice`（`descriptorSetLayouts`） | `VKLogicalDevice.CreateDescriptorSetLayout` | `Destroy` → `VKLogicalDevice.DestroyDescriptorSetLayout` |
 | `VKShaderPipeline` | `VKShaderPipelineLayout`（`shaderPipelines`） | `VKShaderPipelineLayout.CreateRenderPassShaderPipeline` / `CreateDynamicShaderPipeline` | `Destroy` → `VKShaderPipelineLayout.DestroyShaderPipeline` |
 | `VKShaderModule` | `VKLogicalDevice`（`shaderModules`） | `VKLogicalDevice.CreateShaderModule` | `Destroy` → `VKLogicalDevice.DestroyShaderModule` |
 | `VKSwapchain` | `VKLogicalDevice`（`swapchains`） | `VKLogicalDevice.TryCreateOrUpdateSwapchain` | `Destroy` → `VKLogicalDevice.DestroySwapchain` → `VKSurface.DestroySwapchain` |
@@ -653,10 +720,26 @@ VKCommandBuffer ──▶ 录制时用到的帧缓冲 / 渲染通道 / 管线 / 
 
 > `VKShaderPipelineLayout` 的父对象是 `VKLogicalDevice`（`vkCreatePipelineLayout` 是设备级调用），
 > 它**不再挂在渲染通道下面**：布局不绑定某条通道，配合哪条通道是 `VKRenderPassShaderPipeline` 的属性。
+>
+> 描述符那一套的分工同理，按"谁的生命周期由谁决定"定父对象：
+> · `VKDescriptorSetLayout` 归设备（`vkCreateDescriptorSetLayout` 是设备级调用）；
+> · `VKDescriptorPool` 归**布局**（一个池只服务一份布局；池里分配出的集用的就是这份布局，
+>   布局必须比池 / 集活得久 —— 布局的 `Destroy()` 先销毁池，再销毁自己）；
+>   池的预算也由布局的绑定表自动统计（每套每类 `DescriptorCount` 之和 × `maxSets`），调用方不再手填 `pPoolSizes`；
+>   建池时顺手把 `maxSets` 套集全部分配出来（"建池即建集"），所以池一旦有效，它的 `DescriptorSets` 就都可用；
+> · `VKDescriptorSet` 归**池**（不能比池活得久，池一销毁就全部作废）——
+>   同 `VKCommandBuffer` 归 `VKCommandPool`，但**没有单独的分配 / 归还入口**；它**不再单独存布局字段**，
+>   `Layout` 直接取 `Parent.Parent`；
+> · `VKSampler` 归设备（采样器不依附任何图像，同一个采样器能给多张图用）；
+> · 描述符集只是**引用**布局 / 缓冲 / 视图 / 采样器，所以那些都是引用边，不进它名下。
 
 **参考实现，建议新代码照着它们写**：
 
 - 最简形态（单句柄 + 引用父级）：`Vulkan/VKBufferView.cs`
-- 多级形态（一句话柄拆成父子两级）：`Vulkan/VKShaderPipelineLayout.cs` + `Vulkan/VKShaderPipeline.cs`
+- 多级形态（一个句柄拆成父子两级）：`Vulkan/VKShaderPipelineLayout.cs` + `Vulkan/VKShaderPipeline.cs`
 - 多路径形态（一个原生对象、两条互斥创建路径，看 §5.3）：`Vulkan/VKShaderPipeline.cs`
 - 有状态录制（渲染范围状态机 + 按子类类型做兼容性校验，看 §14）：`Vulkan/VKCommandBuffer.cs`
+- 从池里分配的资源（池创建时一次性分配、无单独归还 / 无 `Reset`）：`Vulkan/VKDescriptorPool.cs` + `Vulkan/VKDescriptorSet.cs`（对照 `Vulkan/VKCommandPool.cs` 的"可分可还"形态）
+- 一个调用要读多种句柄类型（描述符集 + 视图 + 采样器，看 §3.3 的逐层收口）：`Vulkan/VKDescriptorSet.cs`
+- 一个类承接多条收口（`vkCreateDescriptorSetLayout` 读采样器句柄、`vkCreatePipelineLayout` 读布局句柄）：`Vulkan/VKDescriptorSetLayout.cs`
+- 单独的设备级资源 + 反向收口（采样器本身在 `Vulkan/VKSampler.cs`，它的句柄由同类型在 `VKDescriptorSet.cs` 里读）：`Vulkan/VKSampler.cs`

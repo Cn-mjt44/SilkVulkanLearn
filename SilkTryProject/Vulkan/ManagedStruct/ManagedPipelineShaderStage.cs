@@ -1,6 +1,6 @@
 using Silk.NET.Vulkan;
 
-namespace SilkTry.Vulkan;
+namespace SilkTry.Vulkan.ManagedStruct;
 
 /// <summary>
 /// 管线着色器阶段（教程《Shader modules》/《Fixed functions》章节里 VkPipelineShaderStageCreateInfo 那一段）的

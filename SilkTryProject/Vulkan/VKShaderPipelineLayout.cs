@@ -33,18 +33,25 @@ namespace SilkTry.Vulkan;
 /// </summary>
 public partial class VKShaderPipelineLayout
 {
+    private readonly static Vk VK = Vk.GetApi();
     /// <summary>父对象：创建这份布局的逻辑设备。销毁、归属校验都走它。</summary>
     public readonly VKLogicalDevice Parent;
 
     /// <summary>创建管线布局时的 flags（那块 PipelineLayoutCreateInfo 在 VKLogicalDevice.CreateShaderPipelineLayout 里）。</summary>
     public readonly PipelineLayoutCreateFlags LayoutFlags;
 
-    /// <summary>创建管线布局时声明的 push constant 范围；null = 没有。</summary>
+    /// <summary>
+    /// 创建管线布局时声明的 push constant 范围；null = 没有。
+    /// 对应 GLSL 的 `layout(push_constant) uniform Push { ... } pc;`：
+    /// 每个 range 的 StageFlags = 哪些阶段访问它，Offset / Size = 这块内存在 push constant 空间中的范围
+    ///（通常是 offset 0、size 等于块大小，长度需为 4 的倍数）。
+    /// </summary>
     public readonly ReadOnlyCollection<PushConstantRange>? PushConstantRanges;
 
     /// <summary>
     /// 这份布局认哪几个描述符集布局（create-info 里的 pSetLayouts）；null = 不管描述符集。
-    /// 顺序就是 set 号（着色器里的 set = N）。
+    /// 顺序就是 set 号（着色器里的 set = N）；GLSL 不写 set 时默认 0，
+    /// 也就是说只用一个 set 也必须把那份布局放在数组的第 0 位。
     /// 引用，不是拥有 —— 描述符集布局由 VKLogicalDevice 持有，**要活得比本布局久**
     ///（VKLogicalDevice.Destroy 先销毁管线布局、再销毁描述符集布局）。
     /// </summary>
@@ -139,8 +146,10 @@ public partial class VKLogicalDevice
     ///
     /// 参数：
     ///   layoutFlags          —— VkPipelineLayoutCreateInfo::flags（一般 None）；
-    ///   pushConstantRanges   —— push constant 范围，null = 没有；
-    ///   descriptorSetLayouts —— 这份布局认哪几个描述符集（顺序 = 着色器里的 set 号），null = 不管描述符集。
+    ///   pushConstantRanges   —— push constant 范围，null = 没有
+    ///                          （对应 GLSL 的 layout(push_constant) 块，StageFlags/Offset/Size 要盖住它）；
+    ///   descriptorSetLayouts —— 这份布局认哪几个描述符集（顺序 = 着色器里的 set 号），null = 不管描述符集；
+    ///                          GLSL 不写 set 时默认 0，只用一个 set 也要放在数组第 0 位。
     /// 生命周期：descriptorSetLayouts 里的布局要活得比本布局久
     ///（VKLogicalDevice.Destroy 就是先销毁管线布局、再销毁描述符集布局）。
     /// </summary>
@@ -226,7 +235,7 @@ public partial class VKDescriptorSetLayout
     ///   logicalDevice / logicalDeviceHandle —— 发起方与它的设备句柄（授权用）；
     ///   layoutFlags                         —— VkPipelineLayoutCreateInfo::flags；
     ///   descriptorSetLayouts                —— 这份布局认哪几个描述符集（顺序 = 着色器里的 set 号），null = 不管描述符集；
-    ///   pushConstantRanges                  —— push constant 范围，null = 没有；
+    ///   pushConstantRanges                  —— push constant 范围，null = 没有（对应 GLSL 的 layout(push_constant)）；
     ///   allocationCallbacks                 —— 可选的内存分配回调。
     /// 返回值是"操作结果"（新建的 PipelineLayout 句柄），由发起方包装 + 登记（登记表在 VKLogicalDevice 上）。
     /// </summary>

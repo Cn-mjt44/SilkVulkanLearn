@@ -1,6 +1,6 @@
 using Silk.NET.Vulkan;
 
-namespace SilkTry.Vulkan;
+namespace SilkTry.Vulkan.ManagedStruct;
 
 /// <summary>
 /// 图形管线的**固定功能状态**（教程《Fixed functions》章节里 VkGraphicsPipelineCreateInfo 那一堆 pXxxState）的
@@ -31,10 +31,14 @@ public struct ManagedPipelineStateCreateInfo
     // 顶点数据在缓冲里怎么排（binding / stride / 每个顶点还是每个实例），以及每个属性在哪（location / format / offset）。
     // 教程早期版本没有顶点缓冲，这一段就是空的。
 
-    /// <summary>顶点绑定描述：第几号 binding、一条顶点数据多大（stride）、逐顶点还是逐实例。</summary>
+    /// <summary>顶点绑定描述：第几号 binding、一条顶点数据多大（stride）、逐顶点还是逐实例。
+    /// 这个 binding 是"顶点缓冲槽"编号，**不是** GLSL 的 layout(binding = N)（那个定位的是描述符槽）；
+    /// 着色器侧对应的是 layout(location = N) in ...（见 <see cref="VertexAttributes"/>）。</summary>
     public VertexInputBindingDescription[]? VertexBindings;
 
-    /// <summary>顶点属性描述：着色器里的 location 几、从哪个 binding 取、什么格式、在顶点数据里的偏移。</summary>
+    /// <summary>顶点属性描述：着色器里的 location 几、从哪个 binding 取、什么格式、在顶点数据里的偏移。
+    /// Location 就是 GLSL 顶点着色器里的 `layout(location = N) in vec2 position;`
+    ///（完整对照见仓库根目录 GLSLDescriptorLayoutMapping.md）。</summary>
     public VertexInputAttributeDescription[]? VertexAttributes;
 
     // ===== ② 图元装配（pInputAssemblyState）=====
