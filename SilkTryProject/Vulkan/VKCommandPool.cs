@@ -10,6 +10,7 @@ public partial class VKCommandPool
     public readonly CommandPoolCreateFlags commandPoolCreateFlags;
     public readonly VKLogicalDevice Parent;
     private readonly CommandPool handle;
+    private readonly int createThreadId;
 
     internal VKCommandPool(VKLogicalDevice parent, CommandPool handle, uint familyIndex, CommandPoolCreateFlags commandPoolCreateFlags)
     {
@@ -17,6 +18,7 @@ public partial class VKCommandPool
         FamilyIndex = familyIndex;
         this.commandPoolCreateFlags = commandPoolCreateFlags;
         this.handle = handle;
+        createThreadId = Thread.CurrentThread.ManagedThreadId;
     }
     public bool Valid => Parent.IsCommandPoolOfThis(this);
     
@@ -28,6 +30,12 @@ public partial class VKCommandPool
             {
                 throw new InvalidOperationException(
                     "The physical device is not valid: it does not belong to the parent VKInstance.");
+            }
+
+            if(Thread.CurrentThread.ManagedThreadId != createThreadId)
+            {
+                throw new InvalidOperationException(
+                    "The command pool is not accessible from the thread that created it.");
             }
 
             return handle;

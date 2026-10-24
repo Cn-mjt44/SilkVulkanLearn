@@ -62,6 +62,8 @@ public partial class VKDescriptorPool
 
     private readonly DescriptorPool handle;
 
+    private readonly int createThreadId;
+
     internal VKDescriptorPool(
         VKDescriptorSetLayout parent,
         DescriptorPool handle,
@@ -77,6 +79,7 @@ public partial class VKDescriptorPool
             sets[i] = new VKDescriptorSet(this, descriptorSets[i]);
         }
         DescriptorSets = new ReadOnlyCollection<VKDescriptorSet>(sets);
+        createThreadId = Thread.CurrentThread.ManagedThreadId;
     }
 
     /// <summary>
@@ -92,6 +95,12 @@ public partial class VKDescriptorPool
             if (!Valid)
             {
                 throw new InvalidOperationException("The descriptor pool is not valid.");
+            }
+
+            if(Thread.CurrentThread.ManagedThreadId != createThreadId)
+            {
+                throw new InvalidOperationException(
+                    "The descriptor pool is not accessible from the thread that created it.");
             }
 
             return handle;

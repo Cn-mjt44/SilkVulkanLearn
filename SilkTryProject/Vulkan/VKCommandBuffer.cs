@@ -75,6 +75,9 @@ public partial class VKCommandBuffer
     private bool isRecording;
 
     private readonly CommandBuffer handle;
+
+    private readonly int createThreadId;
+    
     private readonly static Vk VK = Vk.GetApi();
 
     internal VKCommandBuffer(VKCommandPool parent, CommandBuffer handle, CommandBufferLevel level)
@@ -82,6 +85,7 @@ public partial class VKCommandBuffer
         Parent = parent;
         this.handle = handle;
         Level = level;
+        createThreadId = Thread.CurrentThread.ManagedThreadId;
     }
 
     /// <summary>
@@ -102,6 +106,11 @@ public partial class VKCommandBuffer
                 throw new InvalidOperationException("The command buffer is not valid.");
             }
 
+            if(Thread.CurrentThread.ManagedThreadId != createThreadId)
+            {
+                throw new InvalidOperationException(
+                    "The command buffer is not accessible from the thread that created it.");
+            }
             return handle;
         }
     }

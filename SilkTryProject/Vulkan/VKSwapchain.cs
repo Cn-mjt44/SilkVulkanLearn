@@ -697,8 +697,10 @@ public partial class VKSemaphore
             pSwapchains: &handle,
 
             pImageIndices: &imageIndex);
-
-        return khrSwapchain.QueuePresent(queue, &presentInfo);
+        lock (presentQueue)
+        {
+            return khrSwapchain.QueuePresent(queue, &presentInfo);
+        }
     }
 }
 public partial class VKFence

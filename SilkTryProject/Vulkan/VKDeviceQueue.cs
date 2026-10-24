@@ -265,8 +265,10 @@ public partial class VKDeviceQueue
                 pCommandBuffers: pCommandBuffers,
                 signalSemaphoreCount: (uint)signalSemaphores.Length,
                 pSignalSemaphores: pSignalSemaphores);
-
-            return VK.QueueSubmit(queueHandle, 1, &submitInfo, fence);
+            lock(this)
+            {
+                return VK.QueueSubmit(queueHandle, 1, &submitInfo, fence);
+            }
         }
     }
 
@@ -319,15 +321,19 @@ public partial class VKDeviceQueue
                 signalSemaphoreInfoCount: (uint)signalInfos.Length,
                 pSignalSemaphoreInfos: pSignalInfos);
 
-            if (Parent.Parent.Parent.ApiVersion >= Vk.Version13)
-            {
-                return VK.QueueSubmit2(queueHandle, 1, &submitInfo, fence);
-            }
 
-            if (Parent.EnabledDeviceExtensions.Contains(KhrSynchronization2.ExtensionName)
-                && Parent.TryGetDeviceExtension(out KhrSynchronization2 synchronization2))
+            lock(this)
             {
-                return synchronization2.QueueSubmit2(queueHandle, 1, &submitInfo, fence);
+                if (Parent.Parent.Parent.ApiVersion >= Vk.Version13)
+                {
+                    return VK.QueueSubmit2(queueHandle, 1, &submitInfo, fence);
+                }
+
+                if (Parent.EnabledDeviceExtensions.Contains(KhrSynchronization2.ExtensionName)
+                    && Parent.TryGetDeviceExtension(out KhrSynchronization2 synchronization2))
+                {
+                    return synchronization2.QueueSubmit2(queueHandle, 1, &submitInfo, fence);
+                }
             }
 
             throw new NotSupportedException(
@@ -433,7 +439,11 @@ public partial class VKDeviceQueue
                 signalSemaphoreCount: (uint)signalSemaphores.Length,
                 pSignalSemaphores: pSignalSemaphores);
 
-            return VK.QueueBindSparse(queueHandle, 1, &bindSparseInfo, fence);
+
+            lock(this)
+            {
+                return VK.QueueBindSparse(queueHandle, 1, &bindSparseInfo, fence);
+            }
         }
     }
 

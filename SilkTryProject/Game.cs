@@ -1,5 +1,6 @@
 using System.Numerics;
 using System.Runtime.InteropServices;
+using System.Text;
 using Silk.NET.Core;
 using Silk.NET.Core.Contexts;
 using Silk.NET.Core.Native;
@@ -26,21 +27,25 @@ namespace SilkTry;
 ///   Logical Device     → Logical device and queues
 ///   Command Pool       → Command buffers（命令池部分）
 ///   Swapchain          → Swap chain / Image views
-///   Render Pass        → Render passes
+///   Render Pass        → Render passes（含深度附件，见《Depth buffering》）
 ///   Framebuffers       → Framebuffers
 ///   Shader Modules     → Shader modules
 ///   Graphics Pipeline  → Fixed functions / Graphics pipeline
-///   Vertex Buffer      → Vertex buffer creation
+///   Vertex Buffer      → Vertex buffer creation / Index buffer creation（24 个顶点 + 36 个索引）
 ///   Command Buffers    → Command buffers
 ///   Synchronization    → Rendering and presentation / Frames in flight
-///   OnWindowUpdate     → 教程的 drawFrame()
+///   OnWindowUpdate     → 教程的 drawFrame() + updateUniformBuffer()
 ///
 /// 和教程写法上的差异：
 ///   1. 教程用 GLFW 拿平台句柄，这里交给 Silk.NET 的 IVkSurface 统一处理。
 ///   2. 教程的 shader 用 gl_VertexIndex 生成三角形；本仓库的 simpleShader.vert 声明了
-///      `layout(location = 0) in vec2 position`，所以这里多传一个顶点缓冲（教程《Vertex buffer creation》）。
+///      `layout(location = 0) in vec3 position`，所以这里多传一个顶点缓冲（教程《Vertex buffer creation》）。
 ///   3. 教程的《Swap chain recreation》拆得更细（重建渲染通道 / 管线）；这里把视口 / 裁剪矩形声明成动态状态，
-///      所以窗口尺寸变化时只重建交换链、图像视图、帧缓冲、命令缓冲和按图像的信号量，不重建渲染通道和管线。
+///      所以窗口尺寸变化时只重建交换链、图像视图、深度附件、帧缓冲、命令缓冲和按图像的信号量，
+///      不重建渲染通道和管线。
+///   4. 教程《Uniform buffer》用「UBO + 描述符集」传 MVP；这里改用 **push constant**
+///      （每帧一个矩阵 64 字节，远小于保证支持的 128 字节），省掉描述符集那一路。
+///      代价是 push constant 是录进命令缓冲的，所以命令缓冲改成**每帧重录**。
 /// </summary>
 public class Game_Vulkan
 {
@@ -74,9 +79,24 @@ public class Game_Vulkan
     public readonly VKRenderPassShaderPipeline Pipeline;
 
     public readonly VKBuffer VertexBuffer;
+    public readonly VKBuffer IndexBuffer;
 
     private readonly VKDeviceMemory vertexBufferMemory;
+    private readonly VKDeviceMemory indexBufferMemory;
+
+    // 索引数量（36 = 6 面 × 2 三角形 × 3 个索引）；顶点只有 24 个（每个面 4 个角，面与面之间共用位置但颜色不同）。
+    private readonly int indexCount;
+
+    // 深度附件跟着交换链一起重建（尺寸变了要重新分配）。
+    private readonly Format depthFormat;
+    private VKImage depthImage = null!;
+    private VKDeviceMemory depthImageMemory = null!;
+    private VKImageView depthImageView = null!;
+
     private VKImageView[] swapchainImageViews = null!;
+
+    // 自转用：从窗口创建起累计的秒数（Update 给的 deltaTime 累加）。
+    private double elapsedSeconds;
 
     // imageAvailable 按"帧在途"分配，renderFinished 按"交换链图像"分配（理由见教程）。
     private readonly VKSemaphore[] imageAvailableSemaphores;
@@ -93,13 +113,21 @@ public class Game_Vulkan
     // 窗口尺寸变化只置这个标志，真正的交换链重建放到帧循环里做。
     private bool framebufferResized;
 
-    /// <summary>顶点数据（simpleShader.vert 里 `layout(location = 0) in vec2 position`）。</summary>
+    /// <summary>
+    /// 顶点数据（simpleShader.vert 里 `layout(location = 0) in vec3 position` + `location = 1 in vec3 color`）。
+    /// 布局要和管线里的 VertexInputAttributeDescription 对上：position 在偏移 0、color 在偏移 12。
+    /// </summary>
     [StructLayout(LayoutKind.Sequential)]
     private struct Vertex
     {
-        public float X;
-        public float Y;
+        public Vector3 Position;
         public Vector3 Color;
+
+        public Vertex(Vector3 position, Vector3 color)
+        {
+            Position = position;
+            Color = color;
+        }
     }
 
     private readonly static Vk VK = Vk.GetApi();
@@ -176,8 +204,12 @@ public class Game_Vulkan
         presentFamilyIndex = 0;
         uint bestScore = 0;
 
+        PhysicalDeviceProperties properties;
         foreach (VKPhysicalDevice candidate in Instance.PhysicalDevices)
         {
+            properties = candidate.Properties;
+            Console.WriteLine($"Evaluating device: {Encoding.UTF8.GetString(properties.DeviceName, 256)}");
+
             if (!TryFindQueueFamilies(candidate, out uint candidateGraphics, out uint candidatePresent))
             {
                 continue;
@@ -198,20 +230,20 @@ public class Game_Vulkan
         PhysicalDevice = selectedDevice
             ?? throw new NotSupportedException("failed to find a suitable GPU!");
 
+        properties = PhysicalDevice.Properties;
+        this.Window.Title += $" - {Encoding.UTF8.GetString(properties.DeviceName, 256)}";
+
         #endregion
 
         #region Logical Device
 
         // ===== 教程《Logical device and queues》章节 =====
-        // 图形族和呈现族相同时只建一条队列（同一个 VkDeviceQueueCreateInfo 里出现两次是非法）。
+        // 图形族和呈现族相同时只建一条队列（同一个 VkDeviceQueueCreateInfo 里出现两次是非法，所以这里通过数据结构让非法申请无法表达）。
         Dictionary<uint, float[]> queueFamilies = new()
         {
-            [graphicsFamilyIndex] = [1.0f]
+            [graphicsFamilyIndex] = [1.0f],
+            [presentFamilyIndex] = [1.0f]
         };
-        if (presentFamilyIndex != graphicsFamilyIndex)
-        {
-            queueFamilies[presentFamilyIndex] = [1.0f];
-        }
 
         // 教程这章只开空特性；SamplerAnisotropy 是《Image view and sampler》才用，这里顺手开着。
         PhysicalDeviceFeatures deviceFeatures = new() { SamplerAnisotropy = true };
@@ -222,6 +254,7 @@ public class Game_Vulkan
         LogicalDevice = PhysicalDevice.CreateLogicalDevice(queueFamilies, deviceFeatures, deviceExtensions);
         GraphicsQueue = LogicalDevice.EnabledDeviceQueues[graphicsFamilyIndex][0];
         PresentQueue = LogicalDevice.EnabledDeviceQueues[presentFamilyIndex][0];
+
 
         #endregion
 
@@ -246,6 +279,10 @@ public class Game_Vulkan
 
         // ===== 教程《Render passes》章节 =====
         // ① 附件描述 ② 附件引用 ③ 子通道 ④ 子通道依赖。
+        // 和教程《Depth buffering》一样，这里有两个附件：0 = 颜色，1 = 深度。
+        // 深度格式现在就定下来（建深度图像时还要用同一个）。
+        depthFormat = FindDepthFormat();
+
         AttachmentDescription colorAttachment = new()
         {
             Format = Swapchain.ImageFormat.Format,
@@ -258,32 +295,60 @@ public class Game_Vulkan
             FinalLayout = ImageLayout.PresentSrcKhr
         };
 
+        // 深度只在渲染通道内部用，最后是什么内容没人关心，所以 StoreOp = DontCare。
+        AttachmentDescription depthAttachment = new()
+        {
+            Format = depthFormat,
+            Samples = SampleCountFlags.Count1Bit,
+            LoadOp = AttachmentLoadOp.Clear,
+            StoreOp = AttachmentStoreOp.DontCare,
+            StencilLoadOp = AttachmentLoadOp.DontCare,
+            StencilStoreOp = AttachmentStoreOp.DontCare,
+            InitialLayout = ImageLayout.Undefined,
+            FinalLayout = ImageLayout.DepthStencilAttachmentOptimal
+        };
+
         AttachmentReference colorAttachmentReference = new()
         {
             Attachment = 0,
             Layout = ImageLayout.ColorAttachmentOptimal
         };
 
+        AttachmentReference depthAttachmentReference = new()
+        {
+            Attachment = 1,
+            Layout = ImageLayout.DepthStencilAttachmentOptimal
+        };
+
         ManagedSubpassDescription subpass = new()
         {
             PipelineBindPoint = PipelineBindPoint.Graphics,
-            ColorAttachments = [colorAttachmentReference]
+            ColorAttachments = [colorAttachmentReference],
+            DepthStencilAttachment = depthAttachmentReference
         };
 
         SubpassDependency dependency = new()
         {
             SrcSubpass = uint.MaxValue, // VK_SUBPASS_EXTERNAL
             DstSubpass = 0,
-            SrcStageMask = PipelineStageFlags.ColorAttachmentOutputBit,
+            SrcStageMask = PipelineStageFlags.ColorAttachmentOutputBit | PipelineStageFlags.EarlyFragmentTestsBit,
             SrcAccessMask = 0,
-            DstStageMask = PipelineStageFlags.ColorAttachmentOutputBit,
-            DstAccessMask = AccessFlags.ColorAttachmentWriteBit
+            DstStageMask = PipelineStageFlags.ColorAttachmentOutputBit | PipelineStageFlags.EarlyFragmentTestsBit,
+            DstAccessMask = AccessFlags.ColorAttachmentWriteBit | AccessFlags.DepthStencilAttachmentWriteBit
         };
 
         RenderPass = LogicalDevice.CreateRenderPass(
-            [colorAttachment],
+            [colorAttachment, depthAttachment],
             [subpass],
             [dependency]);
+
+        #endregion
+
+        #region Depth Resources
+
+        // ===== 教程《Depth buffering》章节：createDepthResources() =====
+        // 深度图像是设备本地内存（CPU 不碰它），尺寸跟着交换链走，所以和交换链一起重建。
+        CreateDepthResources();
 
         #endregion
 
@@ -310,12 +375,23 @@ public class Game_Vulkan
         #region Graphics Pipeline
 
         // ===== 教程《Fixed functions》/《Graphics pipeline》章节 =====
-        PipelineLayout = LogicalDevice.CreateShaderPipelineLayout();
+        // MVP 走 push constant（教程这里用的是描述符集里的 uniform buffer）：
+        // 顶点着色器声明了 `layout(push_constant) uniform Push { mat4 mvp; }`，
+        // 所以管线布局里要登记一段同样大小的范围（mat4 = 64 字节，一个阶段，偏移 0）。
+        PushConstantRange mvpPushConstantRange = new()
+        {
+            StageFlags = ShaderStageFlags.VertexBit,
+            Offset = 0,
+            Size = (uint)sizeof(Matrix4x4)
+        };
+
+        PipelineLayout = LogicalDevice.CreateShaderPipelineLayout(
+            pushConstantRanges: [mvpPushConstantRange]);
 
         ManagedPipelineStateCreateInfo pipelineState = ManagedPipelineStateCreateInfo.CreateDefault();
 
         // 顶点输入：一条 binding、步长 = sizeof(Vertex)；
-        // location 0 是 position(vec2)，location 1 是 color(vec3)，对应 simpleShader.vert 里的两个 in 变量。
+        // location 0 是 position(vec3)，location 1 是 color(vec3)，对应 simpleShader.vert 里的两个 in 变量。
         pipelineState.VertexBindings =
         [
             new VertexInputBindingDescription(
@@ -328,7 +404,7 @@ public class Game_Vulkan
             new VertexInputAttributeDescription(
                 location: 0,
                 binding: 0,
-                format: Format.R32G32Sfloat,
+                format: Format.R32G32B32Sfloat,
                 offset: 0),
             new VertexInputAttributeDescription(
                 location: 1,
@@ -336,6 +412,20 @@ public class Game_Vulkan
                 format: Format.R32G32B32Sfloat,
                 offset: (uint)Marshal.OffsetOf<Vertex>(nameof(Vertex.Color)))
         ];
+
+        // 深度测试：立方体的背面 / 内部面会互相重叠，光靠剔除不够稳，必须让深度缓冲决定前后关系。
+        //（CreateDefault 已经把剔除设成 Back、正面设成 Clockwise —— 和投影矩阵里的“Y 翻转”是配套的。）
+        pipelineState.DepthStencilState = new PipelineDepthStencilStateCreateInfo(
+            flags: PipelineDepthStencilStateCreateFlags.None,
+            depthTestEnable: true,
+            depthWriteEnable: true,
+            depthCompareOp: CompareOp.Less,
+            depthBoundsTestEnable: false,
+            stencilTestEnable: false,
+            front: default,
+            back: default,
+            minDepthBounds: 0.0f,
+            maxDepthBounds: 1.0f);
 
         // 视口 / 裁剪矩形声明为**动态状态**：窗口尺寸变化只需要在录制命令缓冲时重新设值，
         // 不用重建管线（教程默认是静态视口，重建交换链时要连管线一起重建）。
@@ -353,39 +443,30 @@ public class Game_Vulkan
 
         #region Vertex Buffer
 
-        // ===== 教程《Vertex buffer creation》章节 =====
-        // 教程用 staging buffer 拷到设备本地内存；示例三角形只有 3 个顶点，
+        // ===== 教程《Vertex buffer creation》/《Index buffer creation》章节 =====
+        // 教程用 staging buffer 拷到设备本地内存；示例数据很小，
         // 直接用 HostVisible|HostCoherent 内存（不经过 staging）就够了。
-        Vertex[] vertices =
-        [
-            new() { X = 0.0f, Y = -0.5f , Color = new Vector3(1.0f, 0.0f, 0.0f) },
-            new() { X = 0.5f, Y = 0.5f, Color = new Vector3(0.0f, 1.0f, 0.0f) },
-            new() { X = -0.5f, Y = 0.5f, Color = new Vector3(0.0f, 0.0f, 1.0f) }
-        ];
+        (Vertex[] vertices, ushort[] indices) = CreateCubeMesh();
+        indexCount = indices.Length;
 
-        VertexBuffer = VKDeviceMemory.CreateBuffer(
-            LogicalDevice,
-            (ulong)(vertices.Length * sizeof(Vertex)),
+        VertexBuffer = CreateHostVisibleBuffer(
+            vertices,
             BufferUsageFlags.VertexBufferBit,
-            MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
             out vertexBufferMemory);
 
-        if (vertexBufferMemory.Map(out Span<byte> mappedVertices) != Result.Success)
-        {
-            throw new NotSupportedException("failed to map vertex buffer memory!");
-        }
-
-        vertices.AsSpan().CopyTo(MemoryMarshal.Cast<byte, Vertex>(mappedVertices));
-        vertexBufferMemory.Flush();
-        vertexBufferMemory.Unmap();
+        IndexBuffer = CreateHostVisibleBuffer(
+            indices,
+            BufferUsageFlags.IndexBufferBit,
+            out indexBufferMemory);
 
         #endregion
 
         #region Command Buffers
 
         // ===== 教程《Command buffers》章节 =====
-        // 命令缓冲里录着具体的帧缓冲和视口尺寸，所以交换链重建后要重新录（见 RecordCommandBuffers）。
-        RecordCommandBuffers();
+        // 命令缓冲里录着具体的帧缓冲和视口尺寸，所以交换链重建后要重新分配（见 AllocateCommandBuffers）。
+        // 每帧还要把新的 MVP push 进去，所以内容是每帧重录的（见 OnWindowUpdate）。
+        AllocateCommandBuffers();
 
         #endregion
 
@@ -422,11 +503,14 @@ public class Game_Vulkan
     }
 
     /// <summary>
-    /// 教程的 drawFrame()：等栅栏 → acquire 图像 → 重置栅栏 → 提交 → 呈现 → currentFrame++。
+    /// 教程的 drawFrame()：等栅栏 → acquire 图像 → 重置栅栏 → 重录命令缓冲（推入新的 MVP）→ 提交 → 呈现 → currentFrame++。
     /// 窗口尺寸变化 / 交换链过期时，在这一帧开始前（或 present 之后）重建交换链。
     /// </summary>
     protected virtual void OnWindowUpdate(double deltaTime)
     {
+        // 自转的时间源：累计经过的秒数（角度回绕放到 CreateMvpMatrix 里按各自周期做）。
+        elapsedSeconds += deltaTime;
+
         // 最小化时 framebuffer 尺寸是 0：Vulkan 不允许建 0 尺寸的交换链，先不出图，
         // 等窗口恢复（恢复时还会再来一次 Resize）。
         if (Window.FramebufferSize.X == 0 || Window.FramebufferSize.Y == 0)
@@ -470,9 +554,13 @@ public class Game_Vulkan
         // ④ 重置栅栏：马上就要用它标记"这一次提交还没完成"。
         fence.Reset();
 
+        // ⑤ 重新录制这张图像的命令缓冲：push constant 里的 MVP 每帧都不一样（方块在自转）。
+        //    安全依据：这张图像刚被 acquire 回来，说明上一次画它的提交已经结束（present 等过 renderFinished 信号量）。
+        RecordCommandBuffer((int)imageIndex, CreateMvpMatrix(elapsedSeconds));
+
         VKSemaphore renderFinished = renderFinishedSemaphores[imageIndex];
 
-        // ⑤ 提交绘制命令：等 imageAvailable → 执行 → 置位 renderFinished，栅栏标记整批完成。
+        // ⑥ 提交绘制命令：等 imageAvailable → 执行 → 置位 renderFinished，栅栏标记整批完成。
         Result submitResult = GraphicsQueue.Submit(
             [CommandBuffers[imageIndex]],
             waitSemaphores: [imageAvailable],
@@ -485,12 +573,12 @@ public class Game_Vulkan
             throw new InvalidOperationException("failed to submit draw command buffer!");
         }
 
-        // ⑥ 呈现：等 renderFinished，把画好的图像交回交换链。
+        // ⑦ 呈现：等 renderFinished，把画好的图像交回交换链。
         Result presentResult = Swapchain.Present(PresentQueue, imageIndex, renderFinished);
 
         currentFrame = (currentFrame + 1) % MaxFramesInFlight;
 
-        // ⑦ 呈现时发现交换链过期 / 不是最优，或者这一帧期间窗口又变了尺寸 —— 下一帧开始前重建。
+        // ⑧ 呈现时发现交换链过期 / 不是最优，或者这一帧期间窗口又变了尺寸 —— 下一帧开始前重建。
         if (presentResult == Result.ErrorOutOfDateKhr ||
             presentResult == Result.SuboptimalKhr ||
             framebufferResized)
@@ -509,8 +597,8 @@ public class Game_Vulkan
     ///
     /// 顺序很重要（每一步都在前面的对象不再被使用之后）：
     ///   等 GPU 空闲 → 释放命令缓冲（录着旧帧缓冲）→ 销毁旧帧缓冲（引用旧图像视图）
-    ///   → 建新交换链（旧链交给驱动复用，新链建好后销毁旧链及其图像视图）
-    ///   → 建新图像视图 / 帧缓冲 → 重新录制命令缓冲 → 重建按图像的 renderFinished 信号量。
+    ///   → 销毁旧深度附件（尺寸跟着交换链走）→ 建新交换链（旧链交给驱动复用，新链建好后销毁旧链及其图像视图）
+    ///   → 建新图像视图 / 深度附件 / 帧缓冲 → 重新分配命令缓冲 → 重建按图像的 renderFinished 信号量。
     ///
     /// 渲染通道和管线不用重建：附件格式没变，视口 / 裁剪矩形已经是动态状态。
     /// </summary>
@@ -533,18 +621,206 @@ public class Game_Vulkan
             commandBuffer.Destroy();
         }
 
-        // 帧缓冲引用旧图像视图，必须在交换链（及其图像视图）销毁前清掉。
+        // 帧缓冲引用旧图像视图和旧深度附件，必须在它们销毁前清掉。
         foreach (VKFramebuffer framebuffer in Framebuffers)
         {
             framebuffer.Destroy();
         }
 
+        // 深度附件的尺寸绑定旧交换链，一起换掉（image.Destroy 会先销毁它的视图）。
+        depthImage.Destroy();
+        depthImageMemory.Destroy();
+
         // 新交换链 + 新图像视图（旧交换链在内部销毁）。
         CreateSwapchain();
 
+        CreateDepthResources();
         CreateFramebuffers();
-        RecordCommandBuffers();
+        AllocateCommandBuffers();
         CreateRenderFinishedSemaphores();
+    }
+
+    /// <summary>
+    /// 教程 createDepthResources()：建深度图像 → 建视图。
+    ///
+    /// 深度图像只在 GPU 上用（CPU 不读也不写），所以是 DeviceLocal 内存、Optimal tiling、
+    /// 用途 DepthStencilAttachment；布局的转换由渲染通道负责（InitialLayout = Undefined → 附件布局）。
+    /// 这里不额外插 barrier：每帧渲染通道都以 Undefined 开始，内容和布局都不用跨帧保留。
+    /// </summary>
+    private void CreateDepthResources()
+    {
+        Extent2D extent = Swapchain.ImageExtent;
+
+        depthImage = VKDeviceMemory.CreateImage(
+            LogicalDevice,
+            depthFormat,
+            new Extent3D(extent.Width, extent.Height, 1),
+            ImageUsageFlags.DepthStencilAttachmentBit,
+            MemoryPropertyFlags.DeviceLocalBit,
+            out depthImageMemory);
+
+        ImageAspectFlags aspectMask = depthFormat is Format.D16Unorm or Format.D32Sfloat
+            ? ImageAspectFlags.DepthBit
+            : ImageAspectFlags.DepthBit | ImageAspectFlags.StencilBit;
+
+        depthImageView = depthImage.CreateImageView(aspectMask);
+    }
+
+    /// <summary>
+    /// 教程 findDepthFormat()：挑一个"能当深度附件用"的格式，精度高的优先。
+    /// </summary>
+    private Format FindDepthFormat()
+    {
+        Format[] candidates =
+        [
+            Format.D32Sfloat,
+            Format.D32SfloatS8Uint,
+            Format.D24UnormS8Uint,
+            Format.D16Unorm
+        ];
+
+        foreach (Format candidate in candidates)
+        {
+            FormatProperties formatProperties = PhysicalDevice.GetFormatProperties(candidate);
+            if (formatProperties.OptimalTilingFeatures.HasFlag(FormatFeatureFlags.DepthStencilAttachmentBit))
+            {
+                return candidate;
+            }
+        }
+
+        throw new NotSupportedException("failed to find a supported depth format!");
+    }
+
+    /// <summary>
+    /// 每帧的 MVP（row-vector 约定，和 System.Numerics 一致：clip = v * model * view * projection）。
+    ///
+    /// 投影矩阵最后乘一个 Y 轴翻转：Vulkan 的 clip space 是 y 轴向下的（OpenGL 向上）。
+    /// 翻转会连带把三角形的屏幕绕序翻过来，所以管线里的正面是 Clockwise —— 和
+    /// <see cref="ManagedPipelineStateCreateInfo.CreateDefault"/> 的默认值一致。
+    ///
+    /// 矩阵按 System.Numerics 的行主序内存布局直接推给着色器：GLSL 的 mat4 默认按列主序解释，
+    /// 正好把它读成转置，于是着色器里的 `pc.mvp * vec4(position, 1.0)` 等价于这边的 row-vector 乘法。
+    /// </summary>
+    private Matrix4x4 CreateMvpMatrix(double seconds)
+    {
+        Extent2D extent = Swapchain.ImageExtent;
+        float aspect = extent.Height == 0 ? 1.0f : extent.Width / (float)extent.Height;
+
+        // 两个轴各自按自己的周期回绕（共用同一个回绕点的话，转速不同就会每隔几秒"跳"一下）。
+        float yaw = (float)(seconds % (2.0 * Math.PI));
+        float pitch = (float)(seconds * 0.6 % (2.0 * Math.PI));
+
+        // 绕 Y 轴匀速转，同时绕 X 轴以慢一点的速度翻，这样三个方向的面会轮流出现。
+        Matrix4x4 model = Matrix4x4.CreateRotationY(yaw) * Matrix4x4.CreateRotationX(pitch);
+        Matrix4x4 view = Matrix4x4.CreateLookAt(new Vector3(1.6f, 1.6f, 1.6f), Vector3.Zero, Vector3.UnitY);
+        Matrix4x4 projection = Matrix4x4.CreatePerspectiveFieldOfView(
+            MathF.PI / 4.0f,
+            aspect,
+            0.1f,
+            100.0f);
+
+        projection *= Matrix4x4.CreateScale(1.0f, -1.0f, 1.0f);
+
+        return model * view * projection;
+    }
+
+    /// <summary>
+    /// 立方体的顶点和索引。
+    ///
+    /// 顶点 24 个（每个面 4 个角）：立方体一共只有 8 个位置，但每个面要单独上色，
+    /// 所以位置会在相邻面之间重复一份 —— 这正是教程《Vertex buffer creation》里说的
+    /// "同一个位置在不同面上有不同属性时，只能拆成不同顶点"。
+    /// 索引 36 个（6 面 × 2 三角形 × 3）：两个三角形共用那条对角线上的两个顶点。
+    ///
+    /// 顶点的绕序统一按"从外面看是逆时针"给出。
+    /// </summary>
+    private static (Vertex[] Vertices, ushort[] Indices) CreateCubeMesh()
+    {
+        const float half = 0.5f;
+
+        // (法线, 面内向右, 面内向上)：三者构成右手系（cross(右, 上) = 法线），
+        // 于是按 左下 → 右下 → 右上 → 左上 连起来，从外面看一定是逆时针。
+        (Vector3 Normal, Vector3 Right, Vector3 Up)[] faces =
+        [
+            (Vector3.UnitX, -Vector3.UnitZ, Vector3.UnitY),
+            (-Vector3.UnitX, Vector3.UnitZ, Vector3.UnitY),
+            (Vector3.UnitY, Vector3.UnitX, -Vector3.UnitZ),
+            (-Vector3.UnitY, Vector3.UnitX, Vector3.UnitZ),
+            (Vector3.UnitZ, Vector3.UnitX, Vector3.UnitY),
+            (-Vector3.UnitZ, -Vector3.UnitX, Vector3.UnitY)
+        ];
+
+        Vector3[] faceColors =
+        [
+            new(0.90f, 0.20f, 0.20f), // +X 红
+            new(0.20f, 0.55f, 0.90f), // -X 蓝
+            new(0.25f, 0.80f, 0.30f), // +Y 绿
+            new(0.85f, 0.75f, 0.20f), // -Y 黄
+            new(0.85f, 0.35f, 0.85f), // +Z 品红
+            new(0.20f, 0.80f, 0.80f)  // -Z 青
+        ];
+
+        Vertex[] vertices = new Vertex[faces.Length * 4];
+        ushort[] indices = new ushort[faces.Length * 6];
+
+        for (int i = 0; i < faces.Length; i++)
+        {
+            (Vector3 normal, Vector3 right, Vector3 up) = faces[i];
+            Vector3 center = normal * half;
+            Vector3 bottomLeft = center - right * half - up * half;
+            Vector3 bottomRight = center + right * half - up * half;
+            Vector3 topRight = center + right * half + up * half;
+            Vector3 topLeft = center - right * half + up * half;
+            Vector3 color = faceColors[i];
+
+            int v = i * 4;
+            vertices[v + 0] = new Vertex(bottomRight, color);
+            vertices[v + 1] = new Vertex(bottomLeft, color);
+            vertices[v + 2] = new Vertex(topLeft, color);
+            vertices[v + 3] = new Vertex(topRight, color);
+
+            // 每个面两个三角形：左下-右下-右上 和 左下-右上-左上。
+            int t = i * 6;
+            indices[t + 0] = (ushort)(v + 0);
+            indices[t + 1] = (ushort)(v + 1);
+            indices[t + 2] = (ushort)(v + 2);
+            indices[t + 3] = (ushort)(v + 0);
+            indices[t + 4] = (ushort)(v + 2);
+            indices[t + 5] = (ushort)(v + 3);
+        }
+
+        return (vertices, indices);
+    }
+
+    /// <summary>
+    /// 建一个 HostVisible|HostCoherent 的数据缓冲并把数组拷进去。
+    ///
+    /// 教程《Vertex buffer creation》末尾会提醒"真正的应用应该先写 staging buffer 再拷到 DeviceLocal 内存"；
+    /// 这里的顶点 / 索引只有几百字节，直接映射写入最省事，也让上下文更短。
+    /// </summary>
+    private VKBuffer CreateHostVisibleBuffer<T>(
+        T[] data,
+        BufferUsageFlags usage,
+        out VKDeviceMemory memory)
+        where T : struct
+    {
+        VKBuffer buffer = VKDeviceMemory.CreateBuffer(
+            LogicalDevice,
+            (ulong)(data.Length * Marshal.SizeOf<T>()),
+            usage,
+            MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+            out memory);
+
+        if (memory.Map(out Span<byte> mapped) != Result.Success)
+        {
+            throw new NotSupportedException("failed to map buffer memory!");
+        }
+
+        data.AsSpan().CopyTo(MemoryMarshal.Cast<byte, T>(mapped));
+        memory.Flush();
+        memory.Unmap();
+
+        return buffer;
     }
 
     /// <summary>
@@ -616,24 +892,32 @@ public class Game_Vulkan
         for (int i = 0; i < Framebuffers.Length; i++)
         {
             Framebuffers[i] = RenderPass.CreateFramebuffer(
-                [swapchainImageViews[i]],
+                [swapchainImageViews[i], depthImageView],
                 extent.Width,
                 extent.Height);
         }
     }
 
     /// <summary>
-    /// 教程 recordCommandBuffer()：每张交换链图像一个命令缓冲，只录一次、每帧重复提交。
-    /// 视口 / 裁剪矩形是动态状态，所以每次录制都按当前交换链尺寸重新设置。
+    /// 教程 createCommandBuffers()：按交换链图像数量分配命令缓冲（一张图像一个，录着它自己的帧缓冲）。
+    /// 内容每帧重录（MVP 在变），分配本身只在初始化和交换链重建时做。
     /// </summary>
-    private void RecordCommandBuffers()
+    private void AllocateCommandBuffers()
     {
         CommandBuffers = CommandPool.AllocateCommandBuffers((uint)Framebuffers.Length);
+    }
 
+    /// <summary>
+    /// 教程 recordCommandBuffer()：录一张交换链图像的命令缓冲。
+    /// 视口 / 裁剪矩形是动态状态，所以每次录制都按当前交换链尺寸重新设置；
+    /// MVP 用 push constant 推进去（教程这一步用的是 UBO + vkCmdBindDescriptorSets）。
+    /// </summary>
+    private void RecordCommandBuffer(int imageIndex, Matrix4x4 mvp)
+    {
         Extent2D extent = Swapchain.ImageExtent;
 
         // 清屏色：暗青色，方便确认渲染通道真的在跑。
-        ClearValue clearValue = new()
+        ClearValue colorClearValue = new()
         {
             Color = new ClearColorValue
             {
@@ -641,6 +925,16 @@ public class Game_Vulkan
                 Float32_1 = 0.05f,
                 Float32_2 = 0.08f,
                 Float32_3 = 1.0f
+            }
+        };
+
+        // 深度附件也要清：1.0 是最远，深度比较用 Less 就是"越小越靠前"。
+        ClearValue depthClearValue = new()
+        {
+            DepthStencil = new ClearDepthStencilValue
+            {
+                Depth = 1.0f,
+                Stencil = 0
             }
         };
 
@@ -662,28 +956,33 @@ public class Game_Vulkan
         };
         Rect2D scissor = renderArea;
 
-        for (int i = 0; i < CommandBuffers.Length; i++)
+        VKCommandBuffer commandBuffer = CommandBuffers[imageIndex];
+
+        // SimultaneousUseBit：允许上一帧还没画完就再次提交同一个命令缓冲。
+        if (commandBuffer.Begin(CommandBufferUsageFlags.SimultaneousUseBit) != Result.Success)
         {
-            VKCommandBuffer commandBuffer = CommandBuffers[i];
+            throw new NotSupportedException("failed to begin recording command buffer!");
+        }
 
-            // SimultaneousUseBit：允许上一帧还没画完就再次提交同一个命令缓冲。
-            if (commandBuffer.Begin(CommandBufferUsageFlags.SimultaneousUseBit) != Result.Success)
-            {
-                throw new NotSupportedException("failed to begin recording command buffer!");
-            }
+        // clearValues 的顺序和渲染通道里的附件顺序一致：0 = 颜色，1 = 深度。
+        commandBuffer.BeginRenderPass(Framebuffers[imageIndex], renderArea, [colorClearValue, depthClearValue]);
+        commandBuffer.BindPipeline(Pipeline, PipelineBindPoint.Graphics);
+        commandBuffer.SetViewport(viewport);
+        commandBuffer.SetScissor(scissor);
+        commandBuffer.PushConstants(
+            PipelineLayout,
+            ShaderStageFlags.VertexBit,
+            0,
+            MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref mvp, 1)));
+        commandBuffer.BindVertexBuffer(VertexBuffer);
+        // 索引是 ushort（24 个顶点用 Uint16 足够，教程也是先 Uint16 再演示 Uint32）。
+        commandBuffer.BindIndexBuffer(IndexBuffer, 0, IndexType.Uint16);
+        commandBuffer.DrawIndexed((uint)indexCount);
+        commandBuffer.EndRenderPass();
 
-            commandBuffer.BeginRenderPass(Framebuffers[i], renderArea, [clearValue]);
-            commandBuffer.BindPipeline(Pipeline, PipelineBindPoint.Graphics);
-            commandBuffer.SetViewport(viewport);
-            commandBuffer.SetScissor(scissor);
-            commandBuffer.BindVertexBuffer(VertexBuffer);
-            commandBuffer.Draw(3);
-            commandBuffer.EndRenderPass();
-
-            if (commandBuffer.End() != Result.Success)
-            {
-                throw new NotSupportedException("failed to record command buffer!");
-            }
+        if (commandBuffer.End() != Result.Success)
+        {
+            throw new NotSupportedException("failed to record command buffer!");
         }
     }
 

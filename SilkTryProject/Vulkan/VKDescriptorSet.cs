@@ -61,12 +61,16 @@ public partial class VKDescriptorSet
     private VKLogicalDevice Device => Parent.Parent.Parent;
 
     private readonly DescriptorSet handle;
+
+    private readonly int createThreadId;
+
     private readonly static Vk VK = Vk.GetApi();
 
     internal VKDescriptorSet(VKDescriptorPool parent, DescriptorSet handle)
     {
         Parent = parent;
         this.handle = handle;
+        createThreadId = Thread.CurrentThread.ManagedThreadId;
     }
 
     /// <summary>
@@ -84,6 +88,11 @@ public partial class VKDescriptorSet
                 throw new InvalidOperationException("The descriptor set is not valid.");
             }
 
+            if(Thread.CurrentThread.ManagedThreadId != createThreadId)
+            {
+                throw new InvalidOperationException(
+                    "The descriptor set is not accessible from the thread that created it.");
+            }
             return handle;
         }
     }
