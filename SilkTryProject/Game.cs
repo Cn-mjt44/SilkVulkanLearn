@@ -779,7 +779,7 @@ public class Game_Vulkan
             vertices[v + 2] = new Vertex(topLeft, color);
             vertices[v + 3] = new Vertex(topRight, color);
 
-            // 每个面两个三角形：左下-右下-右上 和 左下-右上-左上。
+            // 每个面两个三角形：右下-左下-右上 和 右上-左下-左上。
             int t = i * 6;
             indices[t + 0] = (ushort)(v + 0);
             indices[t + 1] = (ushort)(v + 1);
