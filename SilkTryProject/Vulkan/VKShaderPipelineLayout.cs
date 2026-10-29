@@ -77,7 +77,7 @@ public partial class VKShaderPipelineLayout
     /// 和别的包装类一个套路：不去信任手里的句柄，而是反查父对象有没有登记过自己
     ///（登记发生在 VKLogicalDevice.CreateShaderPipelineLayout 里）。
     /// </summary>
-    public bool Valid => Parent.IsShaderPipelineLayoutOfThis(this);
+    public bool Valid => Parent.IsShaderPipelineLayoutOfThis(this) && (DescriptorSetLayouts == null || DescriptorSetLayouts.All(x => x.Valid));
 
     private PipelineLayout CheckedHandle
     {

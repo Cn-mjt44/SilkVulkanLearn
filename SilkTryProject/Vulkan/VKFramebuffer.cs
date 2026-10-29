@@ -70,7 +70,7 @@ public partial class VKFramebuffer
     /// 和别的包装类一个套路：不去信任手里的句柄，而是反查父对象有没有登记过自己
     ///（登记发生在 VKLogicalDevice.CreateFramebuffer 里）。
     /// </summary>
-    public bool Valid => Parent.IsFramebufferOfThis(this);
+    public bool Valid => Parent.IsFramebufferOfThis(this) && Attachments.All(x => x.Valid);
 
     private Framebuffer CheckedHandle
     {

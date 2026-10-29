@@ -77,7 +77,7 @@ public abstract partial class VKShaderPipeline
     /// 和别的包装类一个套路：不去信任手里的句柄，而是反查父对象有没有登记过自己
     ///（登记发生在 VKShaderPipelineLayout.CreateGraphicsPipeline 里）。
     /// </summary>
-    public virtual bool Valid => Parent.IsShaderPipelineOfThis(this);
+    public virtual bool Valid => Parent.IsShaderPipelineOfThis(this) && Stages.All(x => x.Module.Valid);
 
     private Pipeline CheckedHandle
     {
